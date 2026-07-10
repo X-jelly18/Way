@@ -4,7 +4,7 @@ const ROUTES: RouteMap = {
   "/maibhhhh": "http://south.ayanakojivps.shop",
   "/s1": "http://south2.ayanakojivps.shop",
   "/s2": "http://south3.ayanakojivps.shop",
-  "/sus": "https://six.ayanakojivps.shop",
+  "/btc": "https://six.ayanakojivps.shop",
 };
 
 function getTarget(pathname: string): string | null {
@@ -200,4 +200,4 @@ async function connectWebSocket(server: WebSocket, targetUrl: string): Promise<v
     }
     server.close();
   }
-      }
+}
