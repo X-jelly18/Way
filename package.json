@@ -1,0 +1,36 @@
+{
+  "name": "nevermore-proxy",
+  "version": "1.0.0",
+  "description": "Cloudflare Workers HTTP/WebSocket proxy for NevermoreSSH",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "deploy:prod": "wrangler deploy --env production",
+    "lint": "eslint src --fix",
+    "type-check": "tsc --noEmit",
+    "build": "wrangler build",
+    "test": "jest"
+  },
+  "devDependencies": {
+    "@cloudflare/wrangler": "^3.28.0",
+    "@types/node": "^20.10.0",
+    "typescript": "^5.3.3",
+    "eslint": "^8.55.0",
+    "@typescript-eslint/eslint-plugin": "^6.14.0",
+    "@typescript-eslint/parser": "^6.14.0"
+  },
+  "keywords": [
+    "cloudflare",
+    "workers",
+    "proxy",
+    "websocket",
+    "ssh-tunnel"
+  ],
+  "author": "Ayana",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

@@ -1,0 +1,26 @@
+name = "nevermore-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+# HTTP port binding (only for local dev)
+[env.development]
+routes = [
+  { pattern = "ayanakojivps.shop/*", zone_name = "ayanakojivps.shop" }
+]
+
+# Production route
+[env.production]
+routes = [
+  { pattern = "ayanakojivps.shop/*", zone_name = "ayanakojivps.shop" }
+]
+
+# Environment variables - routes as JSON
+[env.production.vars]
+ROUTES_JSON = '{"maibhhhh": "http://south.ayanakojivps.shop", "s1": "http://south2.ayanakojivps.shop", "s2": "http://south3.ayanakojivps.shop", "p6CAaNg": "https://pluto.plutoallin1.shop"}'
+
+# Optional: KV Namespace for dynamic routes (requires CF dashboard setup)
+# [[kv_namespaces]]
+# binding = "ROUTES_KV"
+# id = "your-kv-namespace-id"
+# preview_id = "your-preview-namespace-id"
