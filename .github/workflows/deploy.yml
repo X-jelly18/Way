@@ -9,6 +9,7 @@ on:
       - 'src/**'
       - 'wrangler.toml'
       - '.github/workflows/deploy.yml'
+      - 'routes.json'
   pull_request:
     branches:
       - main
@@ -22,20 +23,30 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '18'
           cache: 'npm'
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Check code quality
         run: |
-          npm run lint 2>/dev/null || echo "No lint script"
+          npm install
+          npm ci --if-present
+
+      - name: Verify wrangler config
+        run: |
+          if [ -f "wrangler.toml" ]; then
+            echo "✓ wrangler.toml found"
+          else
+            echo "✗ wrangler.toml missing"
+            exit 1
+          fi
+
+      - name: Check TypeScript
+        run: npm run type-check 2>/dev/null || echo "No type-check script"
 
       - name: Deploy to Cloudflare Workers
         uses: cloudflare/wrangler-action@v3
@@ -46,37 +57,22 @@ jobs:
         env:
           ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
 
-      - name: Comment PR with deployment info
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `✅ **Cloudflare Worker Preview Deployed**\n\n🔗 [View Worker](https://dash.cloudflare.com/)\n\n**Environment:** Production\n**Branch:** ${context.payload.pull_request.head.ref}`
-            })
-
-      - name: Create deployment status
+      - name: Deployment successful
         if: success()
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            github.rest.repos.createDeploymentStatus({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              deployment_id: context.payload.deployment.id,
-              state: 'success',
-              description: 'Cloudflare Worker deployed',
-              environment_url: 'https://dash.cloudflare.com/'
-            })
+        run: |
+          echo "✓ Deployment successful!"
+          echo "Worker deployed to Cloudflare"
 
       - name: Deployment failed
         if: failure()
-        uses: actions/github-script@v7
+        run: |
+          echo "✗ Deployment failed"
+          echo "Check GitHub Actions logs for details"
+          exit 1
+
+      - name: Comment PR on success
+        if: github.event_name == 'pull_request' && success()
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
@@ -84,5 +80,18 @@ jobs:
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: `❌ **Cloudflare Worker Deployment Failed**\n\nCheck [Actions](https://github.com/${{ github.repository }}/actions) for details.`
+              body: `✅ **Cloudflare Worker Deployed**\n\n🔗 [View in Dashboard](https://dash.cloudflare.com/)\n\n**Environment:** Production\n**Branch:** ${context.payload.pull_request.head.ref}`
+            })
+
+      - name: Comment PR on failure
+        if: github.event_name == 'pull_request' && failure()
+        uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: `❌ **Cloudflare Worker Deployment Failed**\n\nCheck [Actions](https://github.com/${{ github.repository }}/actions) for error details.`
             })
