@@ -1,20 +1,11 @@
-/**
- * Cloudflare Workers HTTP/WebSocket Proxy
- * Converts Express.js proxy to CF Workers
- */
-
 type RouteMap = Record<string, string>;
 
-// Option 1: Hardcoded routes (simple, no KV needed)
 const ROUTES: RouteMap = {
   "/maibhhhh": "http://south.ayanakojivps.shop",
   "/s1": "http://south2.ayanakojivps.shop",
   "/s2": "http://south3.ayanakojivps.shop",
   "/p6CAaNg": "https://pluto.plutoallin1.shop",
 };
-
-// Option 2: Load from env.ROUTES_JSON (set in wrangler.toml or dashboard)
-// const ROUTES: RouteMap = JSON.parse(env.ROUTES_JSON || "{}");
 
 function getTarget(pathname: string): string | null {
   for (const [route, target] of Object.entries(ROUTES)) {
@@ -26,12 +17,18 @@ function getTarget(pathname: string): string | null {
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const target = getTarget(url.pathname);
 
     if (!target) {
-      return new Response("Invalid path", { status: 404 });
+      return new Response(
+        JSON.stringify({ error: "Invalid path", available_routes: Object.keys(ROUTES) }),
+        {
+          status: 404,
+          headers: { "content-type": "application/json" },
+        }
+      );
     }
 
     // WebSocket upgrade
@@ -45,18 +42,27 @@ export default {
 };
 
 /**
- * Handle HTTP proxying
+ * Handle HTTP proxying with persistent connections
  */
 async function handleHTTP(request: Request, target: string): Promise<Response> {
   const url = new URL(request.url);
   const targetUrl = new URL(url.pathname + url.search, target);
 
   try {
-    // Copy headers, excluding host
     const headers = new Headers(request.headers);
     headers.set("host", new URL(target).host);
+    
+    // Remove hop-by-hop headers
     headers.delete("connection");
+    headers.delete("proxy-connection");
+    headers.delete("keep-alive");
+    headers.delete("transfer-encoding");
     headers.delete("upgrade");
+    headers.delete("te");
+    headers.delete("trailer");
+    
+    // Set persistent connection
+    headers.set("connection", "keep-alive");
 
     const proxiedRequest = new Request(targetUrl, {
       method: request.method,
@@ -67,11 +73,21 @@ async function handleHTTP(request: Request, target: string): Promise<Response> {
     const response = await fetch(proxiedRequest);
     const responseHeaders = new Headers(response.headers);
 
-    // Remove hop-by-hop headers
-    responseHeaders.delete("connection");
-    responseHeaders.delete("keep-alive");
-    responseHeaders.delete("transfer-encoding");
-    responseHeaders.delete("upgrade");
+    // Remove hop-by-hop headers from response
+    const hopByHopHeaders = [
+      "connection",
+      "keep-alive",
+      "transfer-encoding",
+      "upgrade",
+      "te",
+      "trailer",
+      "proxy-authenticate",
+      "proxy-authorization",
+    ];
+    hopByHopHeaders.forEach((h) => responseHeaders.delete(h));
+
+    // Keep connection alive
+    responseHeaders.set("connection", "keep-alive");
 
     return new Response(response.body, {
       status: response.status,
@@ -80,24 +96,27 @@ async function handleHTTP(request: Request, target: string): Promise<Response> {
     });
   } catch (err) {
     console.error("HTTP proxy error:", err);
-    return new Response("Bad Gateway", { status: 502 });
+    return new Response(
+      JSON.stringify({ error: "Bad Gateway", details: String(err) }),
+      {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      }
+    );
   }
 }
 
 /**
  * Handle WebSocket proxying
- * Uses Cloudflare's native WebSocket support
  */
 function handleWebSocket(request: Request, target: string): Response {
   const url = new URL(request.url);
   const targetUrl = new URL(url.pathname + url.search, target).toString();
 
   try {
-    // Extract upgrade headers
     const webSocketPair = new WebSocketPair();
     const [client, server] = Object.values(webSocketPair);
 
-    // Connect to target WebSocket
     connectWebSocket(server as unknown as WebSocket, targetUrl);
 
     return new Response(null, {
@@ -111,57 +130,74 @@ function handleWebSocket(request: Request, target: string): Response {
 }
 
 /**
- * Relay WebSocket frames between client and target
+ * Relay WebSocket frames bidirectionally with error handling
  */
 async function connectWebSocket(server: WebSocket, targetUrl: string): Promise<void> {
+  let targetWs: WebSocket | null = null;
+
   try {
-    const targetWs = new WebSocket(targetUrl);
+    targetWs = new WebSocket(targetUrl);
 
-    // Forward client -> target
+    // Forward server -> target
     server.addEventListener("message", (event) => {
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.send(event.data);
+      if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+        try {
+          targetWs.send(event.data);
+        } catch (err) {
+          console.error("Error sending to target:", err);
+        }
       }
     });
 
-    // Forward target -> client
-    targetWs.addEventListener("message", (event) => {
-      if (server.readyState === WebSocket.OPEN) {
-        server.send(event.data);
-      }
-    });
+    if (targetWs) {
+      // Forward target -> server
+      targetWs.addEventListener("message", (event) => {
+        if (server.readyState === WebSocket.OPEN) {
+          try {
+            server.send(event.data);
+          } catch (err) {
+            console.error("Error sending to client:", err);
+          }
+        }
+      });
 
-    // Handle close
-    server.addEventListener("close", () => {
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.close();
-      }
-    });
+      // Handle close from server
+      server.addEventListener("close", () => {
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.close();
+        }
+      });
 
-    targetWs.addEventListener("close", () => {
-      if (server.readyState === WebSocket.OPEN) {
-        server.close();
-      }
-    });
+      // Handle close from target
+      targetWs.addEventListener("close", () => {
+        if (server.readyState === WebSocket.OPEN) {
+          server.close();
+        }
+      });
 
-    // Handle errors
-    server.addEventListener("error", (err) => {
-      console.error("Server WebSocket error:", err);
-      if (targetWs.readyState === WebSocket.OPEN) {
-        targetWs.close();
-      }
-    });
+      // Handle error from server
+      server.addEventListener("error", (err) => {
+        console.error("Server WebSocket error:", err);
+        if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+          targetWs.close();
+        }
+      });
 
-    targetWs.addEventListener("error", (err) => {
-      console.error("Target WebSocket error:", err);
-      if (server.readyState === WebSocket.OPEN) {
-        server.close();
-      }
-    });
+      // Handle error from target
+      targetWs.addEventListener("error", (err) => {
+        console.error("Target WebSocket error:", err);
+        if (server.readyState === WebSocket.OPEN) {
+          server.close();
+        }
+      });
+    }
 
     server.accept();
   } catch (err) {
     console.error("WebSocket connection error:", err);
+    if (targetWs && targetWs.readyState === WebSocket.OPEN) {
+      targetWs.close();
+    }
     server.close();
   }
-}
+      }
