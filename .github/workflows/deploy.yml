@@ -9,19 +9,11 @@ on:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
+      - uses: actions/checkout@v5
 
-      - name: Deploy to Cloudflare Workers
-        uses: cloudflare/wrangler-action@v4
+      - uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          secrets: |
-            ADMIN_TOKEN
-        env:
-          ADMIN_TOKEN: ${{ secrets.ADMIN_TOKEN }}
