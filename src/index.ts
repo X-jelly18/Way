@@ -3,7 +3,7 @@ type RouteMap = Record<string, string>;
 const ROUTES: RouteMap = {
   "/maibhhhh": "http://south.ayanakojivps.shop",
   "/s1": "http://south2.ayanakojivps.shop",
-  "/s2": "http://south3.ayanakojivps.shop",
+  "/s2": "https://facebook.com",
   "/btc": "http://six2.ayanakojivps.shop",
 };
 
