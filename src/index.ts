@@ -4,7 +4,7 @@ const ROUTES: RouteMap = {
   "/maibhhhh": "http://south.ayanakojivps.shop",
   "/s1": "http://south2.ayanakojivps.shop",
   "/s2": "https://facebook.com",
-  "/btc": "http://six3.ayanakojivps.shop",
+  "/btc": "https://six3.ayanakojivps.shop",
 };
 
 function getTarget(pathname: string): string | null {
