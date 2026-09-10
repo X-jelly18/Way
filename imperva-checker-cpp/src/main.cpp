@@ -127,7 +127,8 @@ struct Config {
     std::string output = "imperva_hosts.txt";
     int timeout = 8;
     bool verbose = false;
-    int concurrency = 0;  // 0 => auto-seed
+    int concurrency = 0;  // adaptive seed; 0 => auto-seed from latency probe
+    int threads = 0;      // fixed concurrency (adaptive off); 0 => adaptive
     int retries = 0;      // per-host transport-error retries
     bool head_mode = false;
     Format format = Format::Text;
@@ -362,7 +363,8 @@ static void usage(const char* prog) {
               << "  -i, --input FILE      hosts list (prompted if omitted)\n"
               << "  -o, --output FILE     matches output file (default imperva_hosts.txt)\n"
               << "  -t, --timeout SECS    per-request timeout (default 8)\n"
-              << "  -c, --concurrency N   starting concurrency (default: auto-seed)\n"
+              << "  -c, --concurrency N   adaptive starting concurrency (default: auto-seed)\n"
+              << "  -T, --threads N       fixed concurrency (disables auto-tuning)\n"
               << "  -r, --retries N       retry a host N times on transport error (default 0)\n"
               << "      --head            HEAD-first mode: fetch headers only, GET-fallback\n"
               << "                        when a host rejects HEAD (skips body fingerprint)\n"
@@ -394,6 +396,7 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "-o" || a == "--output") cfg.output = next("--output");
         else if (a == "-t" || a == "--timeout") cfg.timeout = std::stoi(next("--timeout"));
         else if (a == "-c" || a == "--concurrency") cfg.concurrency = std::stoi(next("--concurrency"));
+        else if (a == "-T" || a == "--threads") cfg.threads = std::stoi(next("--threads"));
         else if (a == "-r" || a == "--retries") cfg.retries = std::stoi(next("--retries"));
         else if (a == "--head") cfg.head_mode = true;
         else if (a == "-f" || a == "--format") cfg.format = parse_format(next("--format"));
@@ -402,6 +405,7 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         else { std::cerr << "Unknown argument: " << a << "\n"; usage(argv[0]); std::exit(2); }
     }
     if (cfg.retries < 0) cfg.retries = 0;
+    if (cfg.threads < 0) cfg.threads = 0;
     return true;
 }
 
@@ -447,8 +451,11 @@ static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
     if (!cfg.verbose) print_progress(st, lim);
 }
 
-static Stats run_scan(const Config& cfg, int initial_concurrency) {
-    AdaptiveLimiter lim(initial_concurrency);
+static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive) {
+    // When threads are pinned, clamp floor==ceiling==limit so nothing moves it.
+    AdaptiveLimiter lim = adaptive
+        ? AdaptiveLimiter(initial_concurrency)
+        : AdaptiveLimiter(initial_concurrency, initial_concurrency, initial_concurrency);
     Window win;
     Stats st;
 
@@ -535,11 +542,13 @@ static Stats run_scan(const Config& cfg, int initial_concurrency) {
             active--;
         }
 
-        // Adaptive concurrency monitor (every ~2.5s).
-        auto now = std::chrono::steady_clock::now();
-        if (std::chrono::duration<double>(now - last_adjust).count() >= 2.5) {
-            maybe_adjust(lim, win);
-            last_adjust = now;
+        // Adaptive concurrency monitor (every ~2.5s); skipped when threads pinned.
+        if (adaptive) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - last_adjust).count() >= 2.5) {
+                maybe_adjust(lim, win);
+                last_adjust = now;
+            }
         }
     }
 
@@ -597,7 +606,10 @@ int main(int argc, char** argv) {
     if (argc == 1)  // fully interactive run: also prompt for output
         cfg.output = prompt("Enter output file name for matches", cfg.output);
 
-    int initial = cfg.concurrency > 0 ? cfg.concurrency : seed_initial_concurrency();
+    bool adaptive = (cfg.threads <= 0);
+    int initial = adaptive
+        ? (cfg.concurrency > 0 ? cfg.concurrency : seed_initial_concurrency())
+        : cfg.threads;
 
     // Timestamp banner.
     std::time_t tt = std::time(nullptr);
@@ -606,13 +618,16 @@ int main(int argc, char** argv) {
     const char* mode = cfg.head_mode ? "HEAD-first" : "GET";
     const char* fmt = cfg.format == Format::Csv ? "csv"
                       : cfg.format == Format::Json ? "json" : "text";
+    std::string conc = adaptive
+        ? "auto-concurrency, seeded at " + std::to_string(initial)
+        : std::to_string(initial) + " threads (fixed)";
     std::cout << "\n" << DIM << "[" << ts << "]" << RESET
               << " Starting scan of " << CYAN << cfg.input << RESET
-              << " (auto-concurrency, seeded at " << initial << ", " << mode
+              << " (" << conc << ", " << mode
               << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
               << RESET << " [" << fmt << "]\n\n";
 
-    Stats st = run_scan(cfg, initial);
+    Stats st = run_scan(cfg, initial, adaptive);
 
     std::cout << "\n" << BOLD << GREEN << "Done." << RESET << " "
               << st.checked << " hosts checked, "

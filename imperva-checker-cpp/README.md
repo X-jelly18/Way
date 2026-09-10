@@ -69,7 +69,8 @@ Non-interactive:
 | `-i, --input FILE` | hosts list (prompted if omitted) |
 | `-o, --output FILE` | matches output file (default `imperva_hosts.txt`) |
 | `-t, --timeout SECS` | per-request timeout (default 8) |
-| `-c, --concurrency N` | starting concurrency (default: auto-seed) |
+| `-c, --concurrency N` | adaptive starting concurrency (default: auto-seed) |
+| `-T, --threads N` | fixed concurrency — pins N in-flight requests, disables auto-tuning |
 | `-r, --retries N` | retry a host N times on transport error (default 0) |
 | `--head` | HEAD-first mode (headers only; GET-fallback on 405/501) |
 | `-f, --format FMT` | output format: `text` \| `csv` \| `json` (default `text`) |
@@ -93,6 +94,36 @@ signals while transferring no response body. Hosts that reject `HEAD` (status
 `405`/`501`) are automatically re-tried as `GET`. Note that a pure-`HEAD` hit
 never sees the body, so the weaker "`Imperva` in response body" fingerprint only
 fires on the `GET`-fallback hosts.
+
+### Concurrency
+
+By default the scanner **auto-tunes** how many requests are in flight, seeded
+from a quick latency probe and adjusted from the live error rate and latency.
+Pass `-T/--threads N` to **pin** it to a fixed number instead (the monitor is
+turned off). Use `-c/--concurrency N` to only change the adaptive *starting*
+point while keeping auto-tuning on.
+
+```sh
+imperva_checker -i hosts.txt -T 100      # exactly 100 in flight, fixed
+imperva_checker -i hosts.txt -c 50       # start at 50, auto-tune from there
+```
+
+## Install as a global command (Termux)
+
+To run it from anywhere by a name of your choice, copy the built binary onto
+your `PATH`. On Termux, `$PREFIX/bin` is on the path:
+
+```sh
+cp build/imperva_checker $PREFIX/bin/gh
+chmod +x $PREFIX/bin/gh
+```
+
+Now `gh -i hosts.txt -T 100` works from any directory. To update it later,
+rebuild and copy again. To remove it: `rm $PREFIX/bin/gh`.
+
+> Note: `gh` is also the name of GitHub's official CLI. If you install that
+> later, one will shadow the other — pick a different name (e.g. `impv`) to
+> avoid the clash.
 
 ### Input format
 
