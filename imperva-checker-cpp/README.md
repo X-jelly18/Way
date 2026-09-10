@@ -30,6 +30,11 @@ A host is flagged when any of the following is present in its response:
 - **Silent network sanity check** before scanning (only speaks up if it fails).
 - **Colored output** (auto-disabled when stdout is not a TTY, so piped output
   stays clean).
+- **HEAD-first mode** (`--head`) — fetches headers only to save bandwidth,
+  and automatically falls back to `GET` for a host that rejects `HEAD`
+  (405/501).
+- **Per-host retries** (`--retries N`) on transport errors.
+- **Text / CSV / JSON** output formats.
 - Both **interactive prompts** and **command-line flags** for automation.
 - Graceful `Ctrl+C` — finishes in-flight work and prints the summary.
 
@@ -65,8 +70,29 @@ Non-interactive:
 | `-o, --output FILE` | matches output file (default `imperva_hosts.txt`) |
 | `-t, --timeout SECS` | per-request timeout (default 8) |
 | `-c, --concurrency N` | starting concurrency (default: auto-seed) |
+| `-r, --retries N` | retry a host N times on transport error (default 0) |
+| `--head` | HEAD-first mode (headers only; GET-fallback on 405/501) |
+| `-f, --format FMT` | output format: `text` \| `csv` \| `json` (default `text`) |
 | `-v, --verbose` | print status for every host, not just matches |
 | `-h, --help` | show help |
+
+### Output formats
+
+- `text` — one matching host URL per line. **Appends** to the output file, so
+  matches accumulate across runs.
+- `csv` — `url,status,marker` with a header row; fields are quoted/escaped.
+- `json` — a JSON array of `{"url","status","marker"}` objects.
+
+`csv` and `json` write a single well-formed document, so they **overwrite** the
+output file rather than appending.
+
+### HEAD-first mode
+
+`--head` issues `HEAD` requests, which is enough to catch the header and cookie
+signals while transferring no response body. Hosts that reject `HEAD` (status
+`405`/`501`) are automatically re-tried as `GET`. Note that a pure-`HEAD` hit
+never sees the body, so the weaker "`Imperva` in response body" fingerprint only
+fires on the `GET`-fallback hosts.
 
 ### Input format
 

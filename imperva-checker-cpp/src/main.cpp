@@ -12,17 +12,20 @@
 //   - Adaptive concurrency: an in-flight cap that a lightweight monitor raises
 //     or lowers based on the live error rate and latency.
 //   - Silent network sanity check + latency-seeded starting concurrency.
+//   - Optional HEAD-first mode, per-host retries, and text/CSV/JSON output.
 //
 // Build: see CMakeLists.txt (requires libcurl).
 
 #include <curl/curl.h>
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
-#include <cstdio>
-#include <cstring>
+#include <cctype>
 #include <csignal>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <deque>
 #include <fstream>
 #include <iostream>
@@ -115,6 +118,21 @@ static std::optional<std::string> find_imperva_marker(const std::string& headers
     return std::nullopt;
 }
 
+// ---------- config ----------
+
+enum class Format { Text, Csv, Json };
+
+struct Config {
+    std::string input;
+    std::string output = "imperva_hosts.txt";
+    int timeout = 8;
+    bool verbose = false;
+    int concurrency = 0;  // 0 => auto-seed
+    int retries = 0;      // per-host transport-error retries
+    bool head_mode = false;
+    Format format = Format::Text;
+};
+
 // ---------- per-request state ----------
 
 struct HostJob {
@@ -124,6 +142,8 @@ struct HostJob {
     size_t body_cap = 65536;
     std::chrono::steady_clock::time_point start;
     long status = 0;
+    int attempts = 0;      // transport-error retries used so far
+    bool force_get = false;  // HEAD-mode host that fell back to GET
     CURL* easy = nullptr;
 };
 
@@ -143,6 +163,102 @@ static size_t body_cb(char* ptr, size_t size, size_t nmemb, void* userdata) {
     }
     return total;  // consume everything so the transfer isn't aborted mid-stream
 }
+
+static void setup_easy(HostJob* job, const Config& cfg) {
+    CURL* e = curl_easy_init();
+    job->easy = e;
+    job->start = std::chrono::steady_clock::now();
+
+    curl_easy_setopt(e, CURLOPT_URL, job->url.c_str());
+    curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(e, CURLOPT_MAXREDIRS, 5L);
+    curl_easy_setopt(e, CURLOPT_TIMEOUT, static_cast<long>(cfg.timeout));
+    curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, static_cast<long>(cfg.timeout));
+    curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
+    curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
+    curl_easy_setopt(e, CURLOPT_HEADERFUNCTION, header_cb);
+    curl_easy_setopt(e, CURLOPT_HEADERDATA, job);
+    curl_easy_setopt(e, CURLOPT_USERAGENT, "Mozilla/5.0 (imperva-checker)");
+    curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(e, CURLOPT_PRIVATE, job);
+
+    // HEAD-first mode fetches headers only (no body) until a host proves it
+    // needs a GET fallback; otherwise pull (and decode) the body for matching.
+    if (cfg.head_mode && !job->force_get) {
+        curl_easy_setopt(e, CURLOPT_NOBODY, 1L);
+    } else {
+        curl_easy_setopt(e, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, body_cb);
+        curl_easy_setopt(e, CURLOPT_WRITEDATA, job);
+        curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");  // decode gzip for body search
+    }
+}
+
+// ---------- output writer ----------
+
+static std::string csv_field(const std::string& s) {
+    std::string out = "\"";
+    for (char c : s) {
+        if (c == '"') out += "\"\"";
+        else out += c;
+    }
+    out += "\"";
+    return out;
+}
+
+static std::string json_str(const std::string& s) {
+    std::string out = "\"";
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+        }
+    }
+    out += "\"";
+    return out;
+}
+
+struct OutputWriter {
+    std::ofstream f;
+    Format fmt;
+    bool json_first = true;
+
+    void begin() {
+        if (fmt == Format::Csv) f << "url,status,marker\n";
+        else if (fmt == Format::Json) f << "[\n";
+        f.flush();
+    }
+
+    void row(const std::string& url, long status, const std::string& marker) {
+        if (fmt == Format::Text) {
+            f << url << "\n";
+        } else if (fmt == Format::Csv) {
+            f << csv_field(url) << "," << status << "," << csv_field(marker) << "\n";
+        } else {  // Json
+            if (!json_first) f << ",\n";
+            json_first = false;
+            f << "  {\"url\":" << json_str(url) << ",\"status\":" << status
+              << ",\"marker\":" << json_str(marker) << "}";
+        }
+        f.flush();
+    }
+
+    void end() {
+        if (fmt == Format::Json) f << (json_first ? "]\n" : "\n]\n");
+        f.flush();
+    }
+};
 
 // ---------- adaptive concurrency ----------
 
@@ -230,39 +346,7 @@ static int seed_initial_concurrency() {
     return 15;
 }
 
-// ---------- easy-handle setup ----------
-
-static void setup_easy(HostJob* job, int timeout) {
-    CURL* e = curl_easy_init();
-    job->easy = e;
-    job->start = std::chrono::steady_clock::now();
-
-    curl_easy_setopt(e, CURLOPT_URL, job->url.c_str());
-    curl_easy_setopt(e, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(e, CURLOPT_MAXREDIRS, 5L);
-    curl_easy_setopt(e, CURLOPT_TIMEOUT, static_cast<long>(timeout));
-    curl_easy_setopt(e, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeout));
-    curl_easy_setopt(e, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(e, CURLOPT_SSL_VERIFYHOST, 0L);
-    curl_easy_setopt(e, CURLOPT_HEADERFUNCTION, header_cb);
-    curl_easy_setopt(e, CURLOPT_HEADERDATA, job);
-    curl_easy_setopt(e, CURLOPT_WRITEFUNCTION, body_cb);
-    curl_easy_setopt(e, CURLOPT_WRITEDATA, job);
-    curl_easy_setopt(e, CURLOPT_USERAGENT, "Mozilla/5.0 (imperva-checker)");
-    curl_easy_setopt(e, CURLOPT_ACCEPT_ENCODING, "");  // decode gzip so body search works
-    curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(e, CURLOPT_PRIVATE, job);
-}
-
-// ---------- config ----------
-
-struct Config {
-    std::string input;
-    std::string output = "imperva_hosts.txt";
-    int timeout = 8;
-    bool verbose = false;
-    int concurrency = 0;  // 0 => auto-seed
-};
+// ---------- CLI ----------
 
 static std::string prompt(const std::string& msg, const std::string& def = "") {
     std::string suffix = def.empty() ? "" : " [" + def + "]";
@@ -279,8 +363,21 @@ static void usage(const char* prog) {
               << "  -o, --output FILE     matches output file (default imperva_hosts.txt)\n"
               << "  -t, --timeout SECS    per-request timeout (default 8)\n"
               << "  -c, --concurrency N   starting concurrency (default: auto-seed)\n"
+              << "  -r, --retries N       retry a host N times on transport error (default 0)\n"
+              << "      --head            HEAD-first mode: fetch headers only, GET-fallback\n"
+              << "                        when a host rejects HEAD (skips body fingerprint)\n"
+              << "  -f, --format FMT      output format: text | csv | json (default text)\n"
               << "  -v, --verbose         print status for every host\n"
               << "  -h, --help            show this help\n";
+}
+
+static Format parse_format(const std::string& s) {
+    std::string f = to_lower(s);
+    if (f == "text") return Format::Text;
+    if (f == "csv") return Format::Csv;
+    if (f == "json") return Format::Json;
+    std::cerr << "Invalid --format: " << s << " (use text|csv|json)\n";
+    std::exit(2);
 }
 
 static bool parse_args(int argc, char** argv, Config& cfg) {
@@ -297,10 +394,14 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "-o" || a == "--output") cfg.output = next("--output");
         else if (a == "-t" || a == "--timeout") cfg.timeout = std::stoi(next("--timeout"));
         else if (a == "-c" || a == "--concurrency") cfg.concurrency = std::stoi(next("--concurrency"));
+        else if (a == "-r" || a == "--retries") cfg.retries = std::stoi(next("--retries"));
+        else if (a == "--head") cfg.head_mode = true;
+        else if (a == "-f" || a == "--format") cfg.format = parse_format(next("--format"));
         else if (a == "-v" || a == "--verbose") cfg.verbose = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
         else { std::cerr << "Unknown argument: " << a << "\n"; usage(argv[0]); std::exit(2); }
     }
+    if (cfg.retries < 0) cfg.retries = 0;
     return true;
 }
 
@@ -318,9 +419,9 @@ static void print_progress(const Stats& st, const AdaptiveLimiter& lim) {
               << std::flush;
 }
 
-static void process_done(HostJob* job, CURLcode res, Stats& st, Window& win,
-                         std::ofstream& out, const AdaptiveLimiter& lim,
-                         const Config& cfg) {
+static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
+                          OutputWriter& out, const AdaptiveLimiter& lim,
+                          const Config& cfg) {
     double latency = std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - job->start).count();
     bool ok = (res == CURLE_OK);
@@ -331,8 +432,7 @@ static void process_done(HostJob* job, CURLcode res, Stats& st, Window& win,
         auto marker = find_imperva_marker(job->headers, job->body);
         if (marker) {
             st.matches++;
-            out << job->url << "\n";
-            out.flush();
+            out.row(job->url, job->status, *marker);
             std::cout << "\r" << GREEN << "[MATCH] " << job->url
                       << "  [" << job->status << "]  " << *marker << RESET << "\n";
         } else if (cfg.verbose) {
@@ -353,7 +453,14 @@ static Stats run_scan(const Config& cfg, int initial_concurrency) {
     Stats st;
 
     std::ifstream in(cfg.input);
-    std::ofstream out(cfg.output, std::ios::app);
+    OutputWriter out;
+    out.fmt = cfg.format;
+    // Text appends (matches accumulate across runs); structured formats need a
+    // single well-formed document, so they overwrite.
+    out.f.open(cfg.output, cfg.format == Format::Text
+                               ? (std::ios::out | std::ios::app)
+                               : std::ios::out);
+    out.begin();
 
     CURLM* multi = curl_multi_init();
     int active = 0;
@@ -377,7 +484,7 @@ static Stats run_scan(const Config& cfg, int initial_concurrency) {
             if (!h) { eof = true; break; }
             auto* job = new HostJob{};
             job->url = *h;
-            setup_easy(job, cfg.timeout);
+            setup_easy(job, cfg);
             curl_multi_add_handle(multi, job->easy);
             active++;
         }
@@ -394,12 +501,36 @@ static Stats run_scan(const Config& cfg, int initial_concurrency) {
         while ((msg = curl_multi_info_read(multi, &msgs_left))) {
             if (msg->msg != CURLMSG_DONE) continue;
             CURL* e = msg->easy_handle;
+            CURLcode res = msg->data.result;
             HostJob* job = nullptr;
             curl_easy_getinfo(e, CURLINFO_PRIVATE, &job);
             curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &job->status);
-            process_done(job, msg->data.result, st, win, out, lim, cfg);
             curl_multi_remove_handle(multi, e);
             curl_easy_cleanup(e);
+            job->easy = nullptr;
+
+            // HEAD rejected by origin (405/501) -> retry this host once as GET.
+            if (cfg.head_mode && !job->force_get && res == CURLE_OK &&
+                (job->status == 405 || job->status == 501)) {
+                job->force_get = true;
+                job->headers.clear();
+                job->body.clear();
+                setup_easy(job, cfg);
+                curl_multi_add_handle(multi, job->easy);
+                continue;  // slot stays occupied; do not touch stats/active
+            }
+
+            // Transport error -> retry up to cfg.retries times.
+            if (res != CURLE_OK && job->attempts < cfg.retries) {
+                job->attempts++;
+                job->headers.clear();
+                job->body.clear();
+                setup_easy(job, cfg);
+                curl_multi_add_handle(multi, job->easy);
+                continue;
+            }
+
+            finalize_host(job, res, st, win, out, lim, cfg);
             delete job;
             active--;
         }
@@ -412,6 +543,7 @@ static Stats run_scan(const Config& cfg, int initial_concurrency) {
         }
     }
 
+    out.end();
     curl_multi_cleanup(multi);
     std::cout << "\n";
     return st;
@@ -471,10 +603,14 @@ int main(int argc, char** argv) {
     std::time_t tt = std::time(nullptr);
     char ts[16];
     std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&tt));
+    const char* mode = cfg.head_mode ? "HEAD-first" : "GET";
+    const char* fmt = cfg.format == Format::Csv ? "csv"
+                      : cfg.format == Format::Json ? "json" : "text";
     std::cout << "\n" << DIM << "[" << ts << "]" << RESET
               << " Starting scan of " << CYAN << cfg.input << RESET
-              << " (auto-concurrency, seeded at " << initial << "), output="
-              << CYAN << cfg.output << RESET << "\n\n";
+              << " (auto-concurrency, seeded at " << initial << ", " << mode
+              << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
+              << RESET << " [" << fmt << "]\n\n";
 
     Stats st = run_scan(cfg, initial);
 
