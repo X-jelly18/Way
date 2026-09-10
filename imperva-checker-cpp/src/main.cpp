@@ -603,8 +603,18 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (argc == 1)  // fully interactive run: also prompt for output
+    if (argc == 1) {  // fully interactive run: also prompt for output and threads
         cfg.output = prompt("Enter output file name for matches", cfg.output);
+        std::string tstr = prompt("Threads (a number, or blank for auto)");
+        if (!tstr.empty()) {
+            try {
+                int t = std::stoi(tstr);
+                if (t > 0) cfg.threads = t;
+            } catch (...) {
+                std::cout << YELLOW << "Not a number — using auto-concurrency." << RESET << "\n";
+            }
+        }
+    }
 
     bool adaptive = (cfg.threads <= 0);
     int initial = adaptive

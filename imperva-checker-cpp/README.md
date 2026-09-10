@@ -101,7 +101,9 @@ By default the scanner **auto-tunes** how many requests are in flight, seeded
 from a quick latency probe and adjusted from the live error rate and latency.
 Pass `-T/--threads N` to **pin** it to a fixed number instead (the monitor is
 turned off). Use `-c/--concurrency N` to only change the adaptive *starting*
-point while keeping auto-tuning on.
+point while keeping auto-tuning on. A fully interactive run (no flags) also
+**prompts** for a thread count — enter a number to pin it, or leave it blank
+for auto.
 
 ```sh
 imperva_checker -i hosts.txt -T 100      # exactly 100 in flight, fixed
