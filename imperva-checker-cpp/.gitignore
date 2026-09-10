@@ -1,0 +1,8 @@
+# build output
+build/
+*.o
+*.obj
+imperva_checker
+
+# scan results
+imperva_hosts.txt
