@@ -33,6 +33,7 @@
 #include <sstream>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <netdb.h>
 #include <sys/socket.h>
@@ -118,9 +119,31 @@ static std::optional<std::string> find_imperva_marker(const std::string& headers
     return std::nullopt;
 }
 
+// Returns the value of a header by (case-insensitive) name. When the header
+// appears more than once (e.g. across redirects), the last occurrence wins so
+// the value reflects the final response.
+static std::string find_header(const std::string& headers, const std::string& name) {
+    std::string want = to_lower(name);
+    std::istringstream hs(headers);
+    std::string line, result;
+    while (std::getline(hs, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        size_t pos = line.find(':');
+        if (pos == std::string::npos) continue;
+        if (to_lower(trim(line.substr(0, pos))) == want)
+            result = trim(line.substr(pos + 1));
+    }
+    return result;
+}
+
 // ---------- config ----------
 
 enum class Format { Text, Csv, Json };
+
+// Which scanner to run.
+//   Imperva — fingerprint hosts sitting behind Imperva/Incapsula.
+//   Server  — probe port 443 (then 80) and report the Server header.
+enum class Mode { Imperva, Server };
 
 struct Config {
     std::string input;
@@ -132,6 +155,8 @@ struct Config {
     int retries = 0;      // per-host transport-error retries
     bool head_mode = false;
     Format format = Format::Text;
+    Mode mode = Mode::Imperva;
+    bool mode_explicit = false;  // mode chosen via flag (skip the menu)
 };
 
 // ---------- per-request state ----------
@@ -143,8 +168,10 @@ struct HostJob {
     size_t body_cap = 65536;
     std::chrono::steady_clock::time_point start;
     long status = 0;
+    long port = 0;         // port actually connected to (server-scan)
     int attempts = 0;      // transport-error retries used so far
-    bool force_get = false;  // HEAD-mode host that fell back to GET
+    bool force_get = false;    // HEAD-mode host that fell back to GET
+    bool http_fallback = false;  // server-scan host that fell back to http/80
     CURL* easy = nullptr;
 };
 
@@ -183,9 +210,11 @@ static void setup_easy(HostJob* job, const Config& cfg) {
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_PRIVATE, job);
 
-    // HEAD-first mode fetches headers only (no body) until a host proves it
-    // needs a GET fallback; otherwise pull (and decode) the body for matching.
-    if (cfg.head_mode && !job->force_get) {
+    // Server scan needs only headers. Imperva HEAD-first mode also fetches
+    // headers only until a host proves it needs a GET fallback; otherwise pull
+    // (and decode) the body so the body fingerprint can run.
+    bool head_only = (cfg.mode == Mode::Server) || (cfg.head_mode && !job->force_get);
+    if (head_only) {
         curl_easy_setopt(e, CURLOPT_NOBODY, 1L);
     } else {
         curl_easy_setopt(e, CURLOPT_HTTPGET, 1L);
@@ -230,27 +259,40 @@ static std::string json_str(const std::string& s) {
     return out;
 }
 
+// Generic, column-based writer shared by both scanners. `cols` names the
+// columns (used for the CSV header and JSON keys); each row supplies a
+// pre-formatted `text_line` for text output plus one string per column.
 struct OutputWriter {
     std::ofstream f;
     Format fmt;
     bool json_first = true;
+    std::vector<std::string> cols;
 
     void begin() {
-        if (fmt == Format::Csv) f << "url,status,marker\n";
-        else if (fmt == Format::Json) f << "[\n";
+        if (fmt == Format::Csv) {
+            for (size_t i = 0; i < cols.size(); i++) { if (i) f << ","; f << cols[i]; }
+            f << "\n";
+        } else if (fmt == Format::Json) {
+            f << "[\n";
+        }
         f.flush();
     }
 
-    void row(const std::string& url, long status, const std::string& marker) {
+    void row(const std::string& text_line, const std::vector<std::string>& vals) {
         if (fmt == Format::Text) {
-            f << url << "\n";
+            f << text_line << "\n";
         } else if (fmt == Format::Csv) {
-            f << csv_field(url) << "," << status << "," << csv_field(marker) << "\n";
+            for (size_t i = 0; i < vals.size(); i++) { if (i) f << ","; f << csv_field(vals[i]); }
+            f << "\n";
         } else {  // Json
             if (!json_first) f << ",\n";
             json_first = false;
-            f << "  {\"url\":" << json_str(url) << ",\"status\":" << status
-              << ",\"marker\":" << json_str(marker) << "}";
+            f << "  {";
+            for (size_t i = 0; i < cols.size() && i < vals.size(); i++) {
+                if (i) f << ",";
+                f << json_str(cols[i]) << ":" << json_str(vals[i]);
+            }
+            f << "}";
         }
         f.flush();
     }
@@ -360,6 +402,9 @@ static std::string prompt(const std::string& msg, const std::string& def = "") {
 
 static void usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
+              << "      --mode M          scanner: imperva | server (menu if omitted)\n"
+              << "                        imperva = CDN fingerprint; server = 443/80 + Server\n"
+              << "      --server          shorthand for --mode server\n"
               << "  -i, --input FILE      hosts list (prompted if omitted)\n"
               << "  -o, --output FILE     matches output file (default imperva_hosts.txt)\n"
               << "  -t, --timeout SECS    per-request timeout (default 8)\n"
@@ -392,7 +437,16 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
             }
             return argv[++i];
         };
-        if (a == "-i" || a == "--input") cfg.input = next("--input");
+        if (a == "--mode") {
+            std::string m = to_lower(next("--mode"));
+            if (m == "server") cfg.mode = Mode::Server;
+            else if (m == "imperva") cfg.mode = Mode::Imperva;
+            else { std::cerr << "Invalid --mode: " << m << " (use imperva|server)\n"; std::exit(2); }
+            cfg.mode_explicit = true;
+        }
+        else if (a == "--server") { cfg.mode = Mode::Server; cfg.mode_explicit = true; }
+        else if (a == "--imperva") { cfg.mode = Mode::Imperva; cfg.mode_explicit = true; }
+        else if (a == "-i" || a == "--input") cfg.input = next("--input");
         else if (a == "-o" || a == "--output") cfg.output = next("--output");
         else if (a == "-t" || a == "--timeout") cfg.timeout = std::stoi(next("--timeout"));
         else if (a == "-c" || a == "--concurrency") cfg.concurrency = std::stoi(next("--concurrency"));
@@ -432,20 +486,40 @@ static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
     win.push(ok, latency);
     st.checked++;
 
-    if (ok) {
-        auto marker = find_imperva_marker(job->headers, job->body);
-        if (marker) {
+    if (cfg.mode == Mode::Server) {
+        if (ok) {
+            std::string server = find_header(job->headers, "server");
+            if (server.empty()) server = "(unknown)";
+            std::string pstr = std::to_string(job->port);
+            std::string sstr = std::to_string(job->status);
             st.matches++;
-            out.row(job->url, job->status, *marker);
-            std::cout << "\r" << GREEN << "[MATCH] " << job->url
-                      << "  [" << job->status << "]  " << *marker << RESET << "\n";
+            // Tab-separated text line so the file carries the details, not just
+            // the host (host \t port \t status \t server).
+            std::string line = job->url + "\t" + pstr + "\t" + sstr + "\t" + server;
+            out.row(line, {job->url, pstr, sstr, server});
+            std::cout << "\r" << GREEN << "[OPEN] " << job->url
+                      << "  :" << job->port << "  [" << job->status << "]  Server: "
+                      << server << RESET << "\n";
         } else if (cfg.verbose) {
-            std::cout << "\r" << DIM << "[" << st.checked << "] " << job->url
-                      << " -> " << job->status << " (no match)" << RESET << "\n";
+            std::cout << "\r" << RED << "[" << st.checked << "] " << job->url
+                      << " -> closed/no HTTP: " << curl_easy_strerror(res) << RESET << "\n";
         }
-    } else if (cfg.verbose) {
-        std::cout << "\r" << RED << "[" << st.checked << "] " << job->url
-                  << " -> error: " << curl_easy_strerror(res) << RESET << "\n";
+    } else {  // Imperva
+        if (ok) {
+            auto marker = find_imperva_marker(job->headers, job->body);
+            if (marker) {
+                st.matches++;
+                out.row(job->url, {job->url, std::to_string(job->status), *marker});
+                std::cout << "\r" << GREEN << "[MATCH] " << job->url
+                          << "  [" << job->status << "]  " << *marker << RESET << "\n";
+            } else if (cfg.verbose) {
+                std::cout << "\r" << DIM << "[" << st.checked << "] " << job->url
+                          << " -> " << job->status << " (no match)" << RESET << "\n";
+            }
+        } else if (cfg.verbose) {
+            std::cout << "\r" << RED << "[" << st.checked << "] " << job->url
+                      << " -> error: " << curl_easy_strerror(res) << RESET << "\n";
+        }
     }
 
     if (!cfg.verbose) print_progress(st, lim);
@@ -462,6 +536,9 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
     std::ifstream in(cfg.input);
     OutputWriter out;
     out.fmt = cfg.format;
+    out.cols = (cfg.mode == Mode::Server)
+                   ? std::vector<std::string>{"host", "port", "status", "server"}
+                   : std::vector<std::string>{"url", "status", "marker"};
     // Text appends (matches accumulate across runs); structured formats need a
     // single well-formed document, so they overwrite.
     out.f.open(cfg.output, cfg.format == Format::Text
@@ -512,9 +589,23 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
             HostJob* job = nullptr;
             curl_easy_getinfo(e, CURLINFO_PRIVATE, &job);
             curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &job->status);
+            curl_easy_getinfo(e, CURLINFO_PRIMARY_PORT, &job->port);
             curl_multi_remove_handle(multi, e);
             curl_easy_cleanup(e);
             job->easy = nullptr;
+
+            // Server scan: an https:// host that didn't answer on 443 gets one
+            // retry on http:// (port 80) before being recorded as closed.
+            if (cfg.mode == Mode::Server && !job->http_fallback && res != CURLE_OK &&
+                job->url.rfind("https://", 0) == 0) {
+                job->http_fallback = true;
+                job->url = "http://" + job->url.substr(std::strlen("https://"));
+                job->headers.clear();
+                job->body.clear();
+                setup_easy(job, cfg);
+                curl_multi_add_handle(multi, job->easy);
+                continue;
+            }
 
             // HEAD rejected by origin (405/501) -> retry this host once as GET.
             if (cfg.head_mode && !job->force_get && res == CURLE_OK &&
@@ -558,6 +649,19 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
     return st;
 }
 
+// ---------- menu ----------
+
+static Mode prompt_menu() {
+    std::cout << BOLD << CYAN << "Select a tool:" << RESET << "\n"
+              << "  " << GREEN << "1)" << RESET << " Imperva CDN checker\n"
+              << "  " << GREEN << "2)" << RESET << " Port / server scanner (probe 443/80, show Server)\n"
+              << "  " << GREEN << "0)" << RESET << " Exit\n";
+    std::string c = prompt("Choice", "1");
+    if (c == "0") { std::cout << "Bye.\n"; std::exit(0); }
+    if (c == "2") return Mode::Server;
+    return Mode::Imperva;
+}
+
 // ---------- main ----------
 
 int main(int argc, char** argv) {
@@ -567,7 +671,13 @@ int main(int argc, char** argv) {
     Config cfg;
     if (!parse_args(argc, argv, cfg)) return 0;
 
-    std::cout << BOLD << MAGENTA << "=== Imperva HTTPS Checker (C++) ===\n\n" << RESET;
+    // Interactive when no input file was passed on the command line.
+    bool interactive = cfg.input.empty();
+
+    std::cout << BOLD << MAGENTA << "=== Way Scanner Toolkit (C++) ===\n\n" << RESET;
+
+    // Menu picks the scanner unless one was chosen with a flag.
+    if (interactive && !cfg.mode_explicit) cfg.mode = prompt_menu();
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::cerr << RED << "Failed to initialize libcurl." << RESET << "\n";
@@ -603,8 +713,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (argc == 1) {  // fully interactive run: also prompt for output and threads
-        cfg.output = prompt("Enter output file name for matches", cfg.output);
+    if (interactive) {  // also prompt for output and threads
+        // Sensible default output name per tool.
+        if (cfg.mode == Mode::Server && cfg.output == "imperva_hosts.txt")
+            cfg.output = "servers.txt";
+        cfg.output = prompt("Enter output file name for results", cfg.output);
         std::string tstr = prompt("Threads (a number, or blank for auto)");
         if (!tstr.empty()) {
             try {
@@ -625,23 +738,27 @@ int main(int argc, char** argv) {
     std::time_t tt = std::time(nullptr);
     char ts[16];
     std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&tt));
-    const char* mode = cfg.head_mode ? "HEAD-first" : "GET";
+    const char* reqmode = cfg.mode == Mode::Server ? "HEAD 443->80"
+                          : (cfg.head_mode ? "HEAD-first" : "GET");
+    const char* tool = cfg.mode == Mode::Server ? "server scan" : "Imperva scan";
     const char* fmt = cfg.format == Format::Csv ? "csv"
                       : cfg.format == Format::Json ? "json" : "text";
     std::string conc = adaptive
         ? "auto-concurrency, seeded at " + std::to_string(initial)
         : std::to_string(initial) + " threads (fixed)";
     std::cout << "\n" << DIM << "[" << ts << "]" << RESET
-              << " Starting scan of " << CYAN << cfg.input << RESET
-              << " (" << conc << ", " << mode
+              << " Starting " << tool << " of " << CYAN << cfg.input << RESET
+              << " (" << conc << ", " << reqmode
               << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
               << RESET << " [" << fmt << "]\n\n";
 
     Stats st = run_scan(cfg, initial, adaptive);
 
+    const char* found = cfg.mode == Mode::Server ? " responded (Server shown)."
+                                                 : " matched Imperva marker.";
     std::cout << "\n" << BOLD << GREEN << "Done." << RESET << " "
               << st.checked << " hosts checked, "
-              << GREEN << st.matches << " matched" << RESET << " Imperva marker.\n";
+              << GREEN << st.matches << RESET << found << "\n";
     std::cout << "Saved to " << CYAN << cfg.output << RESET << "\n";
 
     curl_global_cleanup();

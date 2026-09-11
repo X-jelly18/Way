@@ -1,15 +1,31 @@
-# Imperva HTTPS Checker (C++)
+# Way Scanner Toolkit (C++)
 
-A fast HTTPS CDN fingerprinter. It streams a list of hosts and saves the ones
-whose response carries an **Imperva / Incapsula** marker.
+A fast HTTP(S) host scanner with two tools, chosen from a menu (or a flag):
 
-This is a C++ port of the original `imperva_checker.py`, rebuilt on a
-single-threaded [libcurl](https://curl.se/libcurl/) multi-handle event loop —
-the direct analogue of the Python version's `asyncio` / `aiohttp` design. Many
-transfers run in flight on one thread, so there is no thread-per-request
-explosion.
+1. **Imperva CDN checker** — flags hosts sitting behind **Imperva / Incapsula**.
+2. **Port / server scanner** — probes port **443** (falling back to **80**) and
+   reports each live host's `Server` header.
 
-## Detection
+Both share one engine: a single-threaded [libcurl](https://curl.se/libcurl/)
+multi-handle event loop — the direct analogue of the original
+`imperva_checker.py`'s `asyncio` / `aiohttp` design. Many transfers run in
+flight on one thread, so there is no thread-per-request explosion.
+
+## Menu
+
+Run with no arguments and pick a tool:
+
+```
+Select a tool:
+  1) Imperva CDN checker
+  2) Port / server scanner (probe 443/80, show Server)
+  0) Exit
+```
+
+Skip the menu with `--mode imperva` / `--mode server` (or the `--server`
+shorthand).
+
+## Tool 1 — Imperva detection
 
 A host is flagged when any of the following is present in its response:
 
@@ -20,8 +36,17 @@ A host is flagged when any of the following is present in its response:
 | `visid_incap*` / `incap_ses*` | `Set-Cookie` (Incapsula session/visitor cookies) |
 | `Imperva` | first 64 KB of the response body |
 
+## Tool 2 — Port / server scan
+
+For each host it sends a `HEAD` request to `https://` (port 443); if that
+doesn't answer it retries `http://` (port 80). Every host that responds is
+reported with the port it answered on, the HTTP status, and its `Server`
+header. Output columns are `host, port, status, server` (text output is
+tab-separated).
+
 ## Features
 
+- **Two tools, one menu** — Imperva fingerprinting and a port/server scanner.
 - **Streams** the input file line-by-line — safe for multi-GB host lists; the
   whole file is never loaded into memory.
 - **Adaptive concurrency** — a starting cap is seeded from a quick latency
@@ -66,6 +91,8 @@ Non-interactive:
 
 | Flag | Meaning |
 | --- | --- |
+| `--mode M` | scanner: `imperva` \| `server` (shows the menu if omitted) |
+| `--server` | shorthand for `--mode server` |
 | `-i, --input FILE` | hosts list (prompted if omitted) |
 | `-o, --output FILE` | matches output file (default `imperva_hosts.txt`) |
 | `-t, --timeout SECS` | per-request timeout (default 8) |
