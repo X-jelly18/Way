@@ -45,9 +45,35 @@ There is no automatic fallback to port 80 — a host listed explicitly as
 `http://…` is still honored on 80, but bare hostnames are probed on 443 only.
 Output columns are `host, port, status, server` (text output is tab-separated).
 
+## Resume & caching
+
+While a scan runs it writes a checkpoint next to the output file
+(`<output>.cache`) listing every host it has finished. Matched rows are also
+flushed to the output file the moment they're found. If the scan is interrupted
+(`Ctrl+C` or killed), both survive.
+
+On the next run with the same `--output`, the checkpoint is detected and the
+scan **resumes** — already-checked hosts are skipped. Interactive runs ask first
+(`Resume? (Y/n)`); unattended runs auto-resume. Force it either way with
+`--resume` / `--no-resume`. Output is appended when resuming (CSV keeps its
+single header). **JSON output is not resumable** — its single array can't be
+appended cleanly, so a JSON run always starts fresh. On clean completion the
+checkpoint is deleted.
+
+## Network pause
+
+If the whole recent result window fails **and** a DNS check confirms the
+network is actually down, the scan **pauses** instead of burning through the
+rest of the list as errors, then resumes automatically once connectivity is
+back. Disable with `--no-pause`. (A one-shot DNS check also runs at startup.)
+
 ## Features
 
 - **Two tools, one menu** — Imperva fingerprinting and a port/server scanner.
+- **Resumable** — checkpoints progress to `<output>.cache`; an interrupted scan
+  resumes and skips already-checked hosts.
+- **Network-aware** — pauses mid-scan if the network drops and resumes when it
+  returns.
 - **Streams** the input file line-by-line — safe for multi-GB host lists; the
   whole file is never loaded into memory.
 - **Adaptive concurrency** — a starting cap is seeded from a quick latency
@@ -94,6 +120,8 @@ Non-interactive:
 | --- | --- |
 | `--mode M` | scanner: `imperva` \| `server` (shows the menu if omitted) |
 | `--server` | shorthand for `--mode server` |
+| `--resume` / `--no-resume` | force resume from / ignore the `<output>.cache` checkpoint |
+| `--no-pause` | don't pause mid-scan when the network drops |
 | `-i, --input FILE` | hosts list (prompted if omitted) |
 | `-o, --output FILE` | matches output file (default `imperva_hosts.txt`) |
 | `-t, --timeout SECS` | per-request timeout (default 8) |

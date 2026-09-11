@@ -30,8 +30,10 @@
 #include <fstream>
 #include <iostream>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -142,7 +144,7 @@ enum class Format { Text, Csv, Json };
 
 // Which scanner to run.
 //   Imperva — fingerprint hosts sitting behind Imperva/Incapsula.
-//   Server  — probe port 443 (then 80) and report the Server header.
+//   Server  — probe port 443 and report the Server header.
 enum class Mode { Imperva, Server };
 
 struct Config {
@@ -157,6 +159,8 @@ struct Config {
     Format format = Format::Text;
     Mode mode = Mode::Imperva;
     bool mode_explicit = false;  // mode chosen via flag (skip the menu)
+    bool no_pause = false;  // disable mid-scan pause on network loss
+    int resume = 0;         // 0 = auto/ask, 1 = force resume, 2 = force fresh
 };
 
 // ---------- per-request state ----------
@@ -210,10 +214,11 @@ static void setup_easy(HostJob* job, const Config& cfg) {
     curl_easy_setopt(e, CURLOPT_PRIVATE, job);
 
     // Server scan needs only headers (probes 443 only, no port-80 fallback).
-    // Imperva HEAD-first mode also fetches
-    // headers only until a host proves it needs a GET fallback; otherwise pull
-    // (and decode) the body so the body fingerprint can run.
-    bool head_only = (cfg.mode == Mode::Server) || (cfg.head_mode && !job->force_get);
+    // Imperva HEAD-first mode also fetches headers only until a host proves it
+    // needs a GET fallback; otherwise pull (and decode) the body so the body
+    // fingerprint can run.
+    bool head_only = (cfg.mode == Mode::Server) ||
+                     (cfg.head_mode && !job->force_get);
     if (head_only) {
         curl_easy_setopt(e, CURLOPT_NOBODY, 1L);
     } else {
@@ -266,10 +271,11 @@ struct OutputWriter {
     std::ofstream f;
     Format fmt;
     bool json_first = true;
+    bool suppress_header = false;  // resumed CSV appends onto an existing header
     std::vector<std::string> cols;
 
     void begin() {
-        if (fmt == Format::Csv) {
+        if (fmt == Format::Csv && !suppress_header) {
             for (size_t i = 0; i < cols.size(); i++) { if (i) f << ","; f << cols[i]; }
             f << "\n";
         } else if (fmt == Format::Json) {
@@ -403,7 +409,7 @@ static std::string prompt(const std::string& msg, const std::string& def = "") {
 static void usage(const char* prog) {
     std::cout << "Usage: " << prog << " [options]\n"
               << "      --mode M          scanner: imperva | server (menu if omitted)\n"
-              << "                        imperva = CDN fingerprint; server = 443/80 + Server\n"
+              << "                        imperva = CDN fingerprint; server = 443 + Server\n"
               << "      --server          shorthand for --mode server\n"
               << "  -i, --input FILE      hosts list (prompted if omitted)\n"
               << "  -o, --output FILE     matches output file (default imperva_hosts.txt)\n"
@@ -414,6 +420,9 @@ static void usage(const char* prog) {
               << "      --head            HEAD-first mode: fetch headers only, GET-fallback\n"
               << "                        when a host rejects HEAD (skips body fingerprint)\n"
               << "  -f, --format FMT      output format: text | csv | json (default text)\n"
+              << "      --resume          resume from <output>.cache, skipping checked hosts\n"
+              << "      --no-resume       ignore any checkpoint and scan from the top\n"
+              << "      --no-pause        don't pause mid-scan when the network drops\n"
               << "  -v, --verbose         print status for every host\n"
               << "  -h, --help            show this help\n";
 }
@@ -453,6 +462,9 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "-T" || a == "--threads") cfg.threads = std::stoi(next("--threads"));
         else if (a == "-r" || a == "--retries") cfg.retries = std::stoi(next("--retries"));
         else if (a == "--head") cfg.head_mode = true;
+        else if (a == "--resume") cfg.resume = 1;
+        else if (a == "--no-resume") cfg.resume = 2;
+        else if (a == "--no-pause") cfg.no_pause = true;
         else if (a == "-f" || a == "--format") cfg.format = parse_format(next("--format"));
         else if (a == "-v" || a == "--verbose") cfg.verbose = true;
         else if (a == "-h" || a == "--help") { usage(argv[0]); return false; }
@@ -468,6 +480,7 @@ static bool parse_args(int argc, char** argv, Config& cfg) {
 struct Stats {
     long long checked = 0;
     long long matches = 0;
+    long long skipped = 0;  // hosts skipped because a resume checkpoint had them
 };
 
 static void print_progress(const Stats& st, const AdaptiveLimiter& lim) {
@@ -534,27 +547,54 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
     Stats st;
 
     std::ifstream in(cfg.input);
+
+    // ----- resume checkpoint -----
+    // A ".cache" file lists every host already checked. While a scan is
+    // running (unfinished) it persists progress; on clean completion it is
+    // deleted. On resume, already-checked hosts are skipped.
+    std::string cache_path = cfg.output + ".cache";
+    bool resuming = (cfg.resume == 1);
+    std::set<std::string> done;
+    if (resuming) {
+        std::ifstream cf(cache_path);
+        std::string h;
+        while (std::getline(cf, h)) { h = trim(h); if (!h.empty()) done.insert(h); }
+        if (done.empty()) resuming = false;
+    }
+
     OutputWriter out;
     out.fmt = cfg.format;
     out.cols = (cfg.mode == Mode::Server)
                    ? std::vector<std::string>{"host", "port", "status", "server"}
                    : std::vector<std::string>{"url", "status", "marker"};
-    // Text appends (matches accumulate across runs); structured formats need a
-    // single well-formed document, so they overwrite.
-    out.f.open(cfg.output, cfg.format == Format::Text
-                               ? (std::ios::out | std::ios::app)
-                               : std::ios::out);
+    // Text appends (matches accumulate across runs); structured formats
+    // overwrite — unless we are resuming, in which case output is appended so
+    // the prior run's rows survive.
+    bool append_out = (cfg.format == Format::Text) || resuming;
+    // A resumed CSV appends onto its existing header, so don't write it again.
+    if (resuming && cfg.format == Format::Csv) {
+        std::ifstream probe(cfg.output);
+        if (probe.peek() != std::ifstream::traits_type::eof()) out.suppress_header = true;
+    }
+    out.f.open(cfg.output, append_out ? (std::ios::out | std::ios::app) : std::ios::out);
     out.begin();
+
+    // Progress checkpoint stream: append when resuming, else start fresh.
+    std::ofstream cache(cache_path, resuming ? (std::ios::out | std::ios::app)
+                                             : std::ios::out);
 
     CURLM* multi = curl_multi_init();
     int active = 0;
     bool eof = false;
 
+    long long skipped = 0;
     auto next_host = [&]() -> std::optional<std::string> {
         std::string raw;
         while (std::getline(in, raw)) {
             std::string h = normalize_host(raw);
-            if (!h.empty()) return h;
+            if (h.empty()) continue;
+            if (!done.empty() && done.count(h)) { skipped++; continue; }  // resume: already checked
+            return h;
         }
         return std::nullopt;
     };
@@ -616,8 +656,27 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
             }
 
             finalize_host(job, res, st, win, out, lim, cfg);
+            cache << job->url << "\n";  // checkpoint: this host is done
+            cache.flush();
             delete job;
             active--;
+        }
+
+        // Mid-scan network-loss guard: if the whole recent window failed and
+        // DNS is genuinely down, pause (don't burn through the rest of the list
+        // as failures) and wait until connectivity returns.
+        if (!cfg.no_pause && win.samples.size() >= win.maxlen) {
+            bool all_failed = true;
+            for (auto& s : win.samples) if (s.first) { all_failed = false; break; }
+            if (all_failed && !network_up()) {
+                std::cout << "\n" << YELLOW << "Network appears down — pausing scan…"
+                          << RESET << std::endl;
+                while (!g_stop && !network_up())
+                    std::this_thread::sleep_for(std::chrono::seconds(3));
+                if (!g_stop)
+                    std::cout << GREEN << "Network restored — resuming." << RESET << std::endl;
+                win.samples.clear();  // fresh slate so we don't immediately re-trigger
+            }
         }
 
         // Adaptive concurrency monitor (every ~2.5s); skipped when threads pinned.
@@ -632,6 +691,11 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
 
     out.end();
     curl_multi_cleanup(multi);
+    cache.close();
+    st.skipped = skipped;
+    // Finished cleanly -> drop the checkpoint. Interrupted (Ctrl+C) -> keep it
+    // so the next run resumes.
+    if (!g_stop) std::remove(cache_path.c_str());
     std::cout << "\n";
     return st;
 }
@@ -716,6 +780,34 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ----- resume checkpoint decision -----
+    {
+        std::string cache_path = cfg.output + ".cache";
+        long long cached = 0;
+        {
+            std::ifstream cf(cache_path);
+            std::string l;
+            while (std::getline(cf, l)) if (!trim(l).empty()) cached++;
+        }
+        if (cached > 0) {
+            if (cfg.format == Format::Json) {
+                if (cfg.resume == 1)
+                    std::cout << YELLOW << "JSON output can't be resumed — starting fresh."
+                              << RESET << "\n";
+                cfg.resume = 2;  // json's single array can't be appended cleanly
+            } else if (cfg.resume == 0) {
+                if (interactive) {
+                    std::string a = prompt("Found a checkpoint (" + std::to_string(cached) +
+                                           " hosts checked). Resume? (Y/n)", "y");
+                    a = to_lower(a);
+                    cfg.resume = (a == "n" || a == "no") ? 2 : 1;
+                } else {
+                    cfg.resume = 1;  // auto-resume unattended runs
+                }
+            }
+        }
+    }
+
     bool adaptive = (cfg.threads <= 0);
     int initial = adaptive
         ? (cfg.concurrency > 0 ? cfg.concurrency : seed_initial_concurrency())
@@ -725,7 +817,7 @@ int main(int argc, char** argv) {
     std::time_t tt = std::time(nullptr);
     char ts[16];
     std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&tt));
-    const char* reqmode = cfg.mode == Mode::Server ? "HEAD 443"
+    std::string reqmode = cfg.mode == Mode::Server ? "HEAD 443"
                           : (cfg.head_mode ? "HEAD-first" : "GET");
     const char* tool = cfg.mode == Mode::Server ? "server scan" : "Imperva scan";
     const char* fmt = cfg.format == Format::Csv ? "csv"
@@ -746,6 +838,9 @@ int main(int argc, char** argv) {
     std::cout << "\n" << BOLD << GREEN << "Done." << RESET << " "
               << st.checked << " hosts checked, "
               << GREEN << st.matches << RESET << found << "\n";
+    if (st.skipped)
+        std::cout << DIM << "(resumed: skipped " << st.skipped
+                  << " already-checked hosts)" << RESET << "\n";
     std::cout << "Saved to " << CYAN << cfg.output << RESET << "\n";
 
     curl_global_cleanup();
