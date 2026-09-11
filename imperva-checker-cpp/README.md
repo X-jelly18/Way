@@ -3,8 +3,8 @@
 A fast HTTP(S) host scanner with two tools, chosen from a menu (or a flag):
 
 1. **Imperva CDN checker** — flags hosts sitting behind **Imperva / Incapsula**.
-2. **Port / server scanner** — probes port **443** (falling back to **80**) and
-   reports each live host's `Server` header.
+2. **Port / server scanner** — probes port **443** and reports each live host's
+   `Server` header.
 
 Both share one engine: a single-threaded [libcurl](https://curl.se/libcurl/)
 multi-handle event loop — the direct analogue of the original
@@ -18,7 +18,7 @@ Run with no arguments and pick a tool:
 ```
 Select a tool:
   1) Imperva CDN checker
-  2) Port / server scanner (probe 443/80, show Server)
+  2) Port / server scanner (probe 443, show Server)
   0) Exit
 ```
 
@@ -38,11 +38,12 @@ A host is flagged when any of the following is present in its response:
 
 ## Tool 2 — Port / server scan
 
-For each host it sends a `HEAD` request to `https://` (port 443); if that
-doesn't answer it retries `http://` (port 80). Every host that responds is
-reported with the port it answered on, the HTTP status, and its `Server`
-header. Output columns are `host, port, status, server` (text output is
-tab-separated).
+For each host it sends a `HEAD` request to `https://` (port 443). Every host
+that responds is reported with the port it answered on, the HTTP status, and
+its `Server` header; hosts that don't answer on 443 are reported as closed.
+There is no automatic fallback to port 80 — a host listed explicitly as
+`http://…` is still honored on 80, but bare hostnames are probed on 443 only.
+Output columns are `host, port, status, server` (text output is tab-separated).
 
 ## Features
 

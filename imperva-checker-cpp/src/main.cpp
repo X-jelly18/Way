@@ -171,7 +171,6 @@ struct HostJob {
     long port = 0;         // port actually connected to (server-scan)
     int attempts = 0;      // transport-error retries used so far
     bool force_get = false;    // HEAD-mode host that fell back to GET
-    bool http_fallback = false;  // server-scan host that fell back to http/80
     CURL* easy = nullptr;
 };
 
@@ -210,7 +209,8 @@ static void setup_easy(HostJob* job, const Config& cfg) {
     curl_easy_setopt(e, CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(e, CURLOPT_PRIVATE, job);
 
-    // Server scan needs only headers. Imperva HEAD-first mode also fetches
+    // Server scan needs only headers (probes 443 only, no port-80 fallback).
+    // Imperva HEAD-first mode also fetches
     // headers only until a host proves it needs a GET fallback; otherwise pull
     // (and decode) the body so the body fingerprint can run.
     bool head_only = (cfg.mode == Mode::Server) || (cfg.head_mode && !job->force_get);
@@ -594,19 +594,6 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
             curl_easy_cleanup(e);
             job->easy = nullptr;
 
-            // Server scan: an https:// host that didn't answer on 443 gets one
-            // retry on http:// (port 80) before being recorded as closed.
-            if (cfg.mode == Mode::Server && !job->http_fallback && res != CURLE_OK &&
-                job->url.rfind("https://", 0) == 0) {
-                job->http_fallback = true;
-                job->url = "http://" + job->url.substr(std::strlen("https://"));
-                job->headers.clear();
-                job->body.clear();
-                setup_easy(job, cfg);
-                curl_multi_add_handle(multi, job->easy);
-                continue;
-            }
-
             // HEAD rejected by origin (405/501) -> retry this host once as GET.
             if (cfg.head_mode && !job->force_get && res == CURLE_OK &&
                 (job->status == 405 || job->status == 501)) {
@@ -654,7 +641,7 @@ static Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive)
 static Mode prompt_menu() {
     std::cout << BOLD << CYAN << "Select a tool:" << RESET << "\n"
               << "  " << GREEN << "1)" << RESET << " Imperva CDN checker\n"
-              << "  " << GREEN << "2)" << RESET << " Port / server scanner (probe 443/80, show Server)\n"
+              << "  " << GREEN << "2)" << RESET << " Port / server scanner (probe 443, show Server)\n"
               << "  " << GREEN << "0)" << RESET << " Exit\n";
     std::string c = prompt("Choice", "1");
     if (c == "0") { std::cout << "Bye.\n"; std::exit(0); }
@@ -738,7 +725,7 @@ int main(int argc, char** argv) {
     std::time_t tt = std::time(nullptr);
     char ts[16];
     std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&tt));
-    const char* reqmode = cfg.mode == Mode::Server ? "HEAD 443->80"
+    const char* reqmode = cfg.mode == Mode::Server ? "HEAD 443"
                           : (cfg.head_mode ? "HEAD-first" : "GET");
     const char* tool = cfg.mode == Mode::Server ? "server scan" : "Imperva scan";
     const char* fmt = cfg.format == Format::Csv ? "csv"
