@@ -44,6 +44,14 @@ a host's IP falls inside a provider's range, the host is appended to
 server_scanner -i hosts.txt -o servers.txt --cidr-dir ./cdn-ip-ranges --cdn-out-dir ./by-cdn
 ```
 
+A ready-to-use dataset ships in [`cidr-ranges/`](cidr-ranges/) — one file per
+provider (Cloudflare, Imperva, Fastly, CloudFront, Bunny, Gcore, Azure, Edgio,
+Akamai). Point straight at it:
+
+```sh
+server_scanner -i hosts.txt -o servers.txt --cidr-dir cidr-ranges --cdn-out-dir by-cdn
+```
+
 - **Your own results are never touched.** The per-CDN files are entirely
   separate from `--output`; that file is written exactly as it would be without
   this flag.
