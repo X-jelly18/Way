@@ -28,10 +28,39 @@ their implementations under `src/`:
 | config | `config.hpp` | `Config`, CLI parsing, usage, interactive prompts |
 | output | `output.hpp` | text / CSV / JSON result writer |
 | concurrency | `concurrency.hpp` | adaptive in-flight limiter + sliding window |
-| net probes | `netprobe.hpp` | connectivity check + latency-seeded concurrency |
+| net probes | `netprobe.hpp` | connectivity check, latency seed, DNS resolver |
 | http | `http.hpp` | libcurl per-host setup + header lookup |
-| scan | `scan.hpp` | the multi-handle scan loop + stats |
+| cidr | `cidr.hpp` | CDN CIDR database + IP classification |
+| scan | `scan.hpp` | HTTP multi-handle loop + DNS-only loop + stats |
 | entrypoint | `src/main.cpp` | thin orchestrator wiring the modules together |
+
+## DNS-only mode (`--resolve-only`)
+
+`--resolve-only` skips HTTP entirely: it resolves each host to an IP with a pool
+of resolver threads and (with `--cidr-dir`) classifies it by CDN. It's far
+cheaper than a TLS `HEAD`, needs no port open, and is the fastest way to map a
+big list to providers. Output columns become `host, ip, cdn`.
+
+```sh
+server_scanner -i hosts.txt -o resolved.ndjson --resolve-only \
+  --cidr-dir cidr-ranges --cdn-out-dir by-cdn -f ndjson
+```
+
+## Performance & memory
+
+- **Handle & object pooling** — libcurl easy handles and per-request job objects
+  are recycled (`curl_easy_reset`) instead of `init`/`cleanup` per host, so a
+  long scan doesn't churn the allocator.
+- **Connection cache** — the multi handle keeps a connection pool
+  (`CURLMOPT_MAX_TOTAL_CONNECTIONS` / `MAXCONNECTS`) sized to the concurrency.
+- **Per-handle tuning** — HTTP/2 (falls back to 1.1), TCP keep-alive, a DNS
+  cache, and a small header-only buffer.
+- **Streaming** — the input is read line-by-line; the whole file is never loaded.
+
+> Memory note: `--dedup` and `--resume` keep an in-memory set of hosts (dedup
+> keys / completed keys), which grows with the number of *unique* hosts. For an
+> ordinary list this is negligible; for a multi-GB list, expect the set to use
+> memory proportional to the host count. Everything else streams.
 
 ## CDN classification (optional)
 
@@ -148,9 +177,23 @@ Non-interactive:
 | `-c, --concurrency N` | adaptive starting concurrency (default: auto-seed) |
 | `-T, --threads N` | fixed concurrency — pins N in-flight requests, disables auto-tuning |
 | `-r, --retries N` | retry a host N times on transport error (default 0) |
+| `--ports LIST` | comma-separated ports to probe (default `443`) |
+| `--resolve-only` | DNS mode: resolve each host and classify by IP (no HTTP) |
+| `--rate N` | cap new requests to N per second (default: unlimited) |
+| `--limit N` | stop after dispatching N hosts |
+| `--dedup` | skip duplicate host lines within a run |
+| `-A, --user-agent STR` | override the `User-Agent` header |
+| `-H, --header 'K: V'` | add a request header (repeatable) |
+| `-x, --proxy URL` | route all requests through a proxy |
+| `-4` / `-6` | resolve/connect over IPv4 / IPv6 only |
+| `--no-follow` | don't follow HTTP redirects (report the listed host) |
+| `--probe-host HOST` | connectivity/seed probe target (default `m.google.com`) |
+| `--no-probe` | skip the startup connectivity probe and latency seed |
+| `--no-color` | disable colored output |
 | `--cidr-dir DIR` | classify each responder by CDN using the CIDR lists in `DIR` |
 | `--cdn-out-dir DIR` | where to write the per-CDN `<provider>.txt` files (default `.`) |
-| `-f, --format FMT` | output format: `text` \| `csv` \| `json` (default `text`) |
+| `--cdn-only` | only record responders that matched a CDN |
+| `-f, --format FMT` | output format: `text` \| `csv` \| `json` \| `ndjson` (default `text`) |
 | `-v, --verbose` | print status for every host, not just responders |
 | `-h, --help` | show help |
 
@@ -161,9 +204,14 @@ Non-interactive:
   runs.
 - `csv` — `host,port,status,server` with a header row; fields are quoted/escaped.
 - `json` — a JSON array of `{"host","port","status","server"}` objects.
+- `ndjson` — one JSON object per line. Unlike `json` it streams and appends, so
+  it is **resumable**.
 
 `csv` and `json` write a single well-formed document, so they **overwrite** the
-output file rather than appending.
+output file rather than appending (and `json` can't be resumed). `text` and
+`ndjson` append. In `--resolve-only` mode the columns are `host, ip, cdn`.
+
+Pass `-i -` to read the host list from **stdin** (pipe-friendly).
 
 ### Concurrency
 

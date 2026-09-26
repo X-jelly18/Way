@@ -1,7 +1,9 @@
 #include "scanner/netprobe.hpp"
 
 #include <chrono>
+#include <cstring>
 
+#include <arpa/inet.h>
 #include <netdb.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -9,21 +11,21 @@
 
 namespace scanner {
 
-bool network_up() {
+bool network_up(const std::string& host) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo("m.google.com", nullptr, &hints, &res);
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
     if (rc != 0) return false;
     freeaddrinfo(res);
     return true;
 }
 
-int seed_initial_concurrency() {
+int seed_initial_concurrency(const std::string& host) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    if (getaddrinfo("m.google.com", "443", &hints, &res) != 0 || !res)
+    if (getaddrinfo(host.c_str(), "443", &hints, &res) != 0 || !res)
         return 15;
 
     auto start = std::chrono::steady_clock::now();
@@ -43,6 +45,27 @@ int seed_initial_concurrency() {
     if (rtt < 0.15) return 80;
     if (rtt < 0.40) return 40;
     return 15;
+}
+
+std::optional<std::string> resolve_ip(const std::string& host, int family) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = family == 4 ? AF_INET : family == 6 ? AF_INET6 : AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &res) != 0 || !res)
+        return std::nullopt;
+
+    char buf[INET6_ADDRSTRLEN] = {0};
+    const char* out = nullptr;
+    if (res->ai_family == AF_INET) {
+        auto* sa = reinterpret_cast<struct sockaddr_in*>(res->ai_addr);
+        out = inet_ntop(AF_INET, &sa->sin_addr, buf, sizeof(buf));
+    } else if (res->ai_family == AF_INET6) {
+        auto* sa = reinterpret_cast<struct sockaddr_in6*>(res->ai_addr);
+        out = inet_ntop(AF_INET6, &sa->sin6_addr, buf, sizeof(buf));
+    }
+    freeaddrinfo(res);
+    if (!out) return std::nullopt;
+    return std::string(buf);
 }
 
 }  // namespace scanner

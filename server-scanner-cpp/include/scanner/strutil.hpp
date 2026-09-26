@@ -15,4 +15,8 @@ std::string trim(const std::string& s);
 // present. Returns "" for lines that should be skipped.
 std::string normalize_host(const std::string& raw);
 
+// Extract the bare hostname from a URL: strips the scheme, any userinfo, the
+// port, and the path, and unwraps a bracketed IPv6 literal ("[::1]" -> "::1").
+std::string url_host(const std::string& url);
+
 }  // namespace scanner

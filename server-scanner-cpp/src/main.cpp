@@ -37,11 +37,12 @@
 using namespace scanner;
 
 int main(int argc, char** argv) {
-    col::enabled = isatty(fileno(stdout));
     std::signal(SIGINT, on_sigint);
 
     Config cfg;
     if (!parse_args(argc, argv, cfg)) return 0;
+
+    col::enabled = isatty(fileno(stdout)) && !cfg.no_color;
 
     // Interactive when no input file was passed on the command line.
     bool interactive = cfg.input.empty();
@@ -53,10 +54,11 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Silent network sanity check.
-    if (!network_up()) {
+    // Silent network sanity check (skippable for isolated/privacy-sensitive runs).
+    if (!cfg.no_probe && !network_up(cfg.probe_host)) {
         std::cout << YELLOW
-                  << "Could not resolve m.google.com — looks like a DNS/network issue."
+                  << "Could not resolve " << cfg.probe_host
+                  << " — looks like a DNS/network issue."
                   << RESET << "\n";
         std::cout << YELLOW << "Continue anyway? (y/N): " << RESET;
         std::string ans;
@@ -74,7 +76,7 @@ int main(int argc, char** argv) {
         while (cfg.input.empty())
             cfg.input = prompt("Please enter a valid path to hosts .txt file");
     }
-    {
+    if (cfg.input != "-") {  // "-" reads the host list from stdin
         std::ifstream test(cfg.input);
         if (!test) {
             std::cerr << RED << "Can't open " << cfg.input << RESET << "\n";
@@ -143,7 +145,8 @@ int main(int argc, char** argv) {
 
     bool adaptive = (cfg.threads <= 0);
     int initial = adaptive
-        ? (cfg.concurrency > 0 ? cfg.concurrency : seed_initial_concurrency())
+        ? (cfg.concurrency > 0 ? cfg.concurrency
+           : cfg.no_probe ? 15 : seed_initial_concurrency(cfg.probe_host))
         : cfg.threads;
 
     // Timestamp banner.
@@ -151,21 +154,38 @@ int main(int argc, char** argv) {
     char ts[16];
     std::strftime(ts, sizeof(ts), "%H:%M:%S", std::localtime(&tt));
     const char* fmt = cfg.format == Format::Csv ? "csv"
-                      : cfg.format == Format::Json ? "json" : "text";
-    std::string conc = adaptive
-        ? "auto-concurrency, seeded at " + std::to_string(initial)
-        : std::to_string(initial) + " threads (fixed)";
-    std::cout << "\n" << DIM << "[" << ts << "]" << RESET
-              << " Starting server scan of " << CYAN << cfg.input << RESET
-              << " (" << conc << ", HEAD 443"
-              << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
-              << RESET << " [" << fmt << "]\n\n";
+                      : cfg.format == Format::Json ? "json"
+                      : cfg.format == Format::Ndjson ? "ndjson" : "text";
+    std::string ports_str = "443";
+    if (!cfg.ports.empty()) {
+        ports_str.clear();
+        for (size_t i = 0; i < cfg.ports.size(); i++)
+            ports_str += (i ? "," : "") + std::to_string(cfg.ports[i]);
+    }
+    if (cfg.resolve_only) {
+        int rt = cfg.threads > 0 ? cfg.threads
+                 : cfg.resolve_threads > 0 ? cfg.resolve_threads : 32;
+        std::cout << "\n" << DIM << "[" << ts << "]" << RESET
+                  << " Starting DNS resolve of " << CYAN << cfg.input << RESET
+                  << " (" << rt << " resolver threads), output=" << CYAN << cfg.output
+                  << RESET << " [" << fmt << "]\n\n";
+    } else {
+        std::string conc = adaptive
+            ? "auto-concurrency, seeded at " + std::to_string(initial)
+            : std::to_string(initial) + " threads (fixed)";
+        std::cout << "\n" << DIM << "[" << ts << "]" << RESET
+                  << " Starting server scan of " << CYAN << cfg.input << RESET
+                  << " (" << conc << ", HEAD " << ports_str
+                  << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
+                  << RESET << " [" << fmt << "]\n\n";
+    }
 
     Stats st = run_scan(cfg, initial, adaptive, cdn);
 
     std::cout << "\n" << BOLD << GREEN << "Done." << RESET << " "
-              << st.checked << " hosts checked, "
-              << GREEN << st.matches << RESET << " responded (Server shown).\n";
+              << st.checked << (cfg.resolve_only ? " hosts resolved, " : " hosts checked, ")
+              << GREEN << st.matches << RESET
+              << (cfg.resolve_only ? " with an IP.\n" : " responded (Server shown).\n");
     if (st.skipped)
         std::cout << DIM << "(resumed: skipped " << st.skipped
                   << " already-checked hosts)" << RESET << "\n";

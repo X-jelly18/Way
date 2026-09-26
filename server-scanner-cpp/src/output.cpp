@@ -44,6 +44,8 @@ void OutputWriter::begin() {
     } else if (fmt == Format::Json) {
         f << "[\n";
     }
+    // Ndjson has no preamble (each line is a standalone object), so it streams
+    // and appends cleanly.
     f.flush();
 }
 
@@ -53,6 +55,13 @@ void OutputWriter::row(const std::string& text_line, const std::vector<std::stri
     } else if (fmt == Format::Csv) {
         for (size_t i = 0; i < vals.size(); i++) { if (i) f << ","; f << csv_field(vals[i]); }
         f << "\n";
+    } else if (fmt == Format::Ndjson) {
+        f << "{";
+        for (size_t i = 0; i < cols.size() && i < vals.size(); i++) {
+            if (i) f << ",";
+            f << json_str(cols[i]) << ":" << json_str(vals[i]);
+        }
+        f << "}\n";
     } else {  // Json
         if (!json_first) f << ",\n";
         json_first = false;
