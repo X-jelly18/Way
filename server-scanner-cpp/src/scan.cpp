@@ -14,6 +14,7 @@
 #include <vector>
 
 #include <curl/curl.h>
+#include <sys/stat.h>
 
 #include "scanner/cidr.hpp"
 #include "scanner/color.hpp"
@@ -70,7 +71,11 @@ struct RateLimiter {
         double dt = std::chrono::duration<double>(now - last).count();
         last = now;
         allowance += dt * rate;
-        if (allowance > rate) allowance = rate;  // burst capped at ~1s
+        // Cap the burst at ~1s of tokens, but never below one whole token — else
+        // a sub-1 rate (e.g. --rate 0.5) could never accumulate a token and the
+        // dispatch loop would livelock waiting for one.
+        double cap = rate < 1.0 ? 1.0 : rate;
+        if (allowance > cap) allowance = cap;
         int n = static_cast<int>(allowance);
         if (n > want) n = want;
         allowance -= n;
@@ -88,9 +93,12 @@ static long default_port(const std::string& url) {
 }
 
 // Count non-blank, non-comment lines so progress can show a total + ETA. Returns
-// -1 for stdin (unknown total).
+// -1 (unknown) for stdin and any non-regular file (FIFO, device, process
+// substitution) — draining those here would consume the input the scan needs.
 static long long count_hosts(const std::string& path) {
     if (path == "-") return -1;
+    struct stat stt{};
+    if (stat(path.c_str(), &stt) != 0 || !S_ISREG(stt.st_mode)) return -1;
     std::ifstream f(path);
     if (!f) return -1;
     long long n = 0;
@@ -451,26 +459,36 @@ static Stats run_resolve(const Config& cfg, const CidrDb& cdn, long long total) 
     std::mutex mtx;
     HostSet seen;
     long long dispatched = 0, skipped = 0;
+    bool exhausted = false;       // input finished / limit hit: all workers exit
+    std::string stash;            // next host held while rate-limited
+    bool have_stash = false;
     auto scan_start = std::chrono::steady_clock::now();
     auto last_flush = scan_start;
     auto flush_all = [&]() { out.flush(); cache.flush(); cdnw.flush_all(); };
 
     // Pull the next host to resolve under the lock (dedup/resume/limit/rate).
-    // Returns false only when truly finished; returns true with out_host empty
-    // when rate-limited this tick (caller backs off and retries).
+    // Returns false only when truly finished (checked FIRST so throttled workers
+    // still exit promptly once the input is drained); returns true with out_host
+    // empty when rate-limited this tick (caller backs off and retries). A token
+    // is spent only on an actual dispatch, so skips don't burn the rate budget.
     auto next_host = [&](std::string& out_host) -> bool {
         for (;;) {
-            if (g_stop) return false;
+            if (g_stop || exhausted) return false;
+            if (!have_stash) {  // find the next real host to dispatch
+                std::string raw;
+                if (!std::getline(in, raw)) { exhausted = true; return false; }
+                std::string h = normalize_host(raw);
+                if (h.empty()) continue;
+                if (cfg.dedup && !seen.insert(h).second) continue;
+                if (!done.empty() && done.count(h)) { skipped++; continue; }
+                if (cfg.limit && dispatched >= cfg.limit) { exhausted = true; return false; }
+                stash = h;
+                have_stash = true;
+            }
             if (cfg.rate > 0 && limiter.take(1) == 0) { out_host.clear(); return true; }
-            std::string raw;
-            if (!std::getline(in, raw)) return false;
-            std::string h = normalize_host(raw);
-            if (h.empty()) continue;
-            if (cfg.dedup && !seen.insert(h).second) continue;
-            if (cfg.limit && dispatched >= cfg.limit) return false;
-            if (!done.empty() && done.count(h)) { skipped++; continue; }
             dispatched++;
-            out_host = h;
+            out_host = stash;
+            have_stash = false;
             return true;
         }
     };

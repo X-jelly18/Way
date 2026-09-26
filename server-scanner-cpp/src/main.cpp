@@ -144,6 +144,14 @@ int main(int argc, char** argv) {
         }
     }
 
+    // --cdn-only only filters when there's a CIDR database to match against;
+    // without one it would discard every result silently. Warn and ignore it.
+    if (cfg.cdn_only && cdn.empty()) {
+        std::cout << YELLOW << "--cdn-only needs --cidr-dir with loadable ranges; "
+                  << "ignoring it and recording all responders." << RESET << "\n";
+        cfg.cdn_only = false;
+    }
+
     bool adaptive = (cfg.threads <= 0);
     int initial = adaptive
         ? (cfg.concurrency > 0 ? cfg.concurrency
