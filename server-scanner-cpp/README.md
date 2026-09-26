@@ -165,13 +165,28 @@ The binary is written to `build/server_scanner`.
 
 ## Usage
 
-Interactive (prompts for input/output files):
+**Guided (prompt-based).** Run it with no `-i` and it walks you through the
+essentials — tool (server scan vs DNS-only), hosts file, output file, threads,
+CDN ranges dir, and (if a checkpoint exists) whether to resume. Just press Enter
+to accept each default:
 
 ```sh
 ./build/server_scanner
 ```
 
-Non-interactive:
+```
+Select a tool:
+  1) Server scan (HEAD probe port 443, show Server header)
+  2) DNS-only (resolve each host and classify by CDN, no HTTP)
+Choice [1]:
+Path to hosts .txt file (or - for stdin):
+Output file for results [servers.txt]:
+Threads (a number, or blank for auto):
+CIDR ranges dir for CDN classification (blank to skip):
+```
+
+**Scripted (flags).** Passing `-i` skips every prompt, so the same tool drives
+automation. Any flag also pre-fills/overrides its prompt:
 
 ```sh
 ./build/server_scanner -i hosts.txt -o servers.txt -t 8 -v

@@ -55,46 +55,76 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Silent network sanity check (skippable for isolated/privacy-sensitive runs).
+    // Silent network sanity check (skippable with --no-probe). In the guided
+    // flow we ask; a scripted (flags) run just warns and continues.
     if (!cfg.no_probe && !network_up(cfg.probe_host)) {
         std::cout << YELLOW
                   << "Could not resolve " << cfg.probe_host
-                  << " — looks like a DNS/network issue."
-                  << RESET << "\n";
-        std::cout << YELLOW << "Continue anyway? (y/N): " << RESET;
-        std::string ans;
-        std::getline(std::cin, ans);
-        if (to_lower(trim(ans)) != "y") {
-            std::cout << RED << "Aborted. Fix your network/DNS and try again." << RESET << "\n";
-            curl_global_cleanup();
-            return 1;
+                  << " — looks like a DNS/network issue." << RESET << "\n";
+        if (interactive) {
+            std::cout << YELLOW << "Continue anyway? (y/N): " << RESET;
+            std::string ans;
+            std::getline(std::cin, ans);
+            if (to_lower(trim(ans)) != "y") {
+                std::cout << RED << "Aborted. Fix your network/DNS and try again." << RESET << "\n";
+                curl_global_cleanup();
+                return 1;
+            }
+        } else {
+            std::cout << YELLOW << "Continuing anyway." << RESET << "\n";
         }
     }
 
-    // Resolve input/output interactively when not passed as args.
-    if (cfg.input.empty()) {
-        cfg.input = prompt("Enter path to hosts .txt file");
+    // ----- guided prompt flow (only when no -i was given; flags skip it) -----
+    if (interactive) {
+        // Tool choice (unless a mode flag already picked one).
+        if (!cfg.resolve_only) {
+            std::string m = prompt(
+                "Select a tool:\n"
+                "  1) Server scan (HEAD probe port 443, show Server header)\n"
+                "  2) DNS-only (resolve each host and classify by CDN, no HTTP)\n"
+                "Choice", "1");
+            std::string ml = to_lower(m);
+            if (m == "2" || ml == "dns" || ml == "resolve") cfg.resolve_only = true;
+        }
+        // A sensible default output name for the DNS-only tool.
+        if (cfg.resolve_only && cfg.output == "servers.txt") cfg.output = "resolved.txt";
+
+        cfg.input = prompt("Path to hosts .txt file (or - for stdin)");
         while (cfg.input.empty())
-            cfg.input = prompt("Please enter a valid path to hosts .txt file");
+            cfg.input = prompt("Please enter a valid path to hosts .txt file (or -)");
+
+        cfg.output = prompt("Output file for results", cfg.output);
+
+        std::string tstr = prompt(cfg.resolve_only
+                                      ? "Resolver threads (a number, or blank for 32)"
+                                      : "Threads (a number, or blank for auto)");
+        if (!tstr.empty()) {
+            try {
+                int t = std::stoi(tstr);
+                if (t > 0) cfg.threads = t;
+            } catch (...) {
+                std::cout << YELLOW << "Not a number — using the default." << RESET << "\n";
+            }
+        }
+
+        // CDN classification (unless --cidr-dir was already given).
+        if (cfg.cidr_dir.empty()) {
+            std::string cd = prompt("CIDR ranges dir for CDN classification (blank to skip)");
+            if (!cd.empty()) {
+                cfg.cidr_dir = cd;
+                cfg.cdn_out_dir = prompt("Directory to write per-CDN <provider>.txt files",
+                                         cfg.cdn_out_dir);
+            }
+        }
     }
+
     if (cfg.input != "-") {  // "-" reads the host list from stdin
         std::ifstream test(cfg.input);
         if (!test) {
             std::cerr << RED << "Can't open " << cfg.input << RESET << "\n";
             curl_global_cleanup();
             return 1;
-        }
-    }
-    if (interactive) {  // also prompt for output and threads
-        cfg.output = prompt("Enter output file name for results", cfg.output);
-        std::string tstr = prompt("Threads (a number, or blank for auto)");
-        if (!tstr.empty()) {
-            try {
-                int t = std::stoi(tstr);
-                if (t > 0) cfg.threads = t;
-            } catch (...) {
-                std::cout << YELLOW << "Not a number — using auto-concurrency." << RESET << "\n";
-            }
         }
     }
 
