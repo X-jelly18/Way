@@ -24,8 +24,10 @@
 #include <string>
 
 #include <curl/curl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
+#include "scanner/cidr.hpp"
 #include "scanner/color.hpp"
 #include "scanner/config.hpp"
 #include "scanner/netprobe.hpp"
@@ -121,6 +123,24 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ----- optional CDN classification database -----
+    CidrDb cdn;
+    if (!cfg.cidr_dir.empty()) {
+        int providers = 0;
+        long long ranges = 0;
+        if (!cdn.load(cfg.cidr_dir, &providers, &ranges) || cdn.empty()) {
+            std::cout << YELLOW << "No CIDR ranges loaded from " << cfg.cidr_dir
+                      << " — CDN classification disabled." << RESET << "\n";
+        } else {
+            // Make sure the per-CDN output directory exists.
+            if (cfg.cdn_out_dir != "." && !cfg.cdn_out_dir.empty())
+                mkdir(cfg.cdn_out_dir.c_str(), 0755);  // no-op if it already exists
+            std::cout << DIM << "Loaded " << ranges << " ranges across "
+                      << providers << " providers for CDN classification -> "
+                      << cfg.cdn_out_dir << "/<provider>.txt" << RESET << "\n";
+        }
+    }
+
     bool adaptive = (cfg.threads <= 0);
     int initial = adaptive
         ? (cfg.concurrency > 0 ? cfg.concurrency : seed_initial_concurrency())
@@ -141,7 +161,7 @@ int main(int argc, char** argv) {
               << ", retries=" << cfg.retries << "), output=" << CYAN << cfg.output
               << RESET << " [" << fmt << "]\n\n";
 
-    Stats st = run_scan(cfg, initial, adaptive);
+    Stats st = run_scan(cfg, initial, adaptive, cdn);
 
     std::cout << "\n" << BOLD << GREEN << "Done." << RESET << " "
               << st.checked << " hosts checked, "
@@ -150,6 +170,16 @@ int main(int argc, char** argv) {
         std::cout << DIM << "(resumed: skipped " << st.skipped
                   << " already-checked hosts)" << RESET << "\n";
     std::cout << "Saved to " << CYAN << cfg.output << RESET << "\n";
+    if (!st.cdn_counts.empty()) {
+        std::cout << "CDN matches -> " << cfg.cdn_out_dir << "/: ";
+        bool first = true;
+        for (const auto& kv : st.cdn_counts) {
+            std::cout << (first ? "" : ", ") << CYAN << kv.first << RESET
+                      << "=" << kv.second;
+            first = false;
+        }
+        std::cout << "\n";
+    }
 
     curl_global_cleanup();
     return 0;

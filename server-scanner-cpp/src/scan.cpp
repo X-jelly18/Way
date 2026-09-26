@@ -11,6 +11,9 @@
 
 #include <curl/curl.h>
 
+#include <map>
+
+#include "scanner/cidr.hpp"
 #include "scanner/color.hpp"
 #include "scanner/concurrency.hpp"
 #include "scanner/http.hpp"
@@ -23,6 +26,29 @@ namespace scanner {
 volatile std::sig_atomic_t g_stop = 0;
 void on_sigint(int) { g_stop = 1; }
 
+// Lazily-opened per-provider output. Each provider's file is opened on its first
+// hit and kept open for the rest of the run; a fresh run truncates it, a resumed
+// run appends. Kept entirely separate from the user's own results file.
+struct CdnWriter {
+    std::string dir;
+    bool resuming = false;
+    std::map<std::string, std::ofstream> streams;
+
+    void write(const std::string& provider, const std::string& host) {
+        auto it = streams.find(provider);
+        if (it == streams.end()) {
+            std::ofstream& f = streams[provider];
+            std::string path = dir.empty() ? provider + ".txt"
+                                           : dir + "/" + provider + ".txt";
+            f.open(path, resuming ? (std::ios::out | std::ios::app)
+                                  : (std::ios::out | std::ios::trunc));
+            it = streams.find(provider);
+        }
+        it->second << host << "\n";
+        it->second.flush();
+    }
+};
+
 static void print_progress(const Stats& st, const AdaptiveLimiter& lim) {
     std::cout << "\r" << CYAN << "[checked " << st.checked << "]" << RESET << " "
               << GREEN << st.matches << " responded" << RESET << " "
@@ -32,7 +58,7 @@ static void print_progress(const Stats& st, const AdaptiveLimiter& lim) {
 
 static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
                           OutputWriter& out, const AdaptiveLimiter& lim,
-                          const Config& cfg) {
+                          const Config& cfg, const CidrDb& cdn, CdnWriter& cdnw) {
     double latency = std::chrono::duration<double>(
                          std::chrono::steady_clock::now() - job->start).count();
     bool ok = (res == CURLE_OK);
@@ -49,9 +75,22 @@ static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
         // the host (host \t port \t status \t server).
         std::string line = job->url + "\t" + pstr + "\t" + sstr + "\t" + server;
         out.row(line, {job->url, pstr, sstr, server});
+
+        // CDN classification is additive: it writes to <provider>.txt only and
+        // never touches the user's own results file (`out`) above.
+        std::string cdn_note;
+        if (!cdn.empty() && !job->ip.empty()) {
+            auto prov = cdn.classify(job->ip);
+            if (prov) {
+                cdnw.write(*prov, job->url);
+                st.cdn_counts[*prov]++;
+                cdn_note = "  " + std::string(CYAN) + "(" + *prov + ")" + RESET;
+            }
+        }
+
         std::cout << "\r" << GREEN << "[OPEN] " << job->url
                   << "  :" << job->port << "  [" << job->status << "]  Server: "
-                  << server << RESET << "\n";
+                  << server << RESET << cdn_note << "\n";
     } else if (cfg.verbose) {
         std::cout << "\r" << RED << "[" << st.checked << "] " << job->url
                   << " -> closed/no HTTP: " << curl_easy_strerror(res) << RESET << "\n";
@@ -60,7 +99,8 @@ static void finalize_host(HostJob* job, CURLcode res, Stats& st, Window& win,
     if (!cfg.verbose) print_progress(st, lim);
 }
 
-Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive) {
+Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive,
+               const CidrDb& cdn) {
     // When threads are pinned, clamp floor==ceiling==limit so nothing moves it.
     AdaptiveLimiter lim = adaptive
         ? AdaptiveLimiter(initial_concurrency)
@@ -102,6 +142,12 @@ Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive) {
     // Progress checkpoint stream: append when resuming, else start fresh.
     std::ofstream cache(cache_path, resuming ? (std::ios::out | std::ios::app)
                                              : std::ios::out);
+
+    // Per-CDN output. Mirrors the checkpoint's resume behavior: fresh runs
+    // truncate each provider file on first hit, resumed runs append.
+    CdnWriter cdnw;
+    cdnw.dir = cfg.cdn_out_dir;
+    cdnw.resuming = resuming;
 
     CURLM* multi = curl_multi_init();
     int active = 0;
@@ -150,6 +196,9 @@ Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive) {
             curl_easy_getinfo(e, CURLINFO_PRIVATE, &job);
             curl_easy_getinfo(e, CURLINFO_RESPONSE_CODE, &job->status);
             curl_easy_getinfo(e, CURLINFO_PRIMARY_PORT, &job->port);
+            char* ipbuf = nullptr;
+            if (curl_easy_getinfo(e, CURLINFO_PRIMARY_IP, &ipbuf) == CURLE_OK && ipbuf)
+                job->ip = ipbuf;  // valid until cleanup; copied into the job now
             curl_multi_remove_handle(multi, e);
             curl_easy_cleanup(e);
             job->easy = nullptr;
@@ -158,12 +207,13 @@ Stats run_scan(const Config& cfg, int initial_concurrency, bool adaptive) {
             if (res != CURLE_OK && job->attempts < cfg.retries) {
                 job->attempts++;
                 job->headers.clear();
+                job->ip.clear();
                 setup_easy(job, cfg);
                 curl_multi_add_handle(multi, job->easy);
                 continue;
             }
 
-            finalize_host(job, res, st, win, out, lim, cfg);
+            finalize_host(job, res, st, win, out, lim, cfg, cdn, cdnw);
             cache << job->url << "\n";  // checkpoint: this host is done
             cache.flush();
             delete job;

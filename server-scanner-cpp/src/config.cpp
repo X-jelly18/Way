@@ -26,6 +26,9 @@ void usage(const char* prog) {
               << "  -c, --concurrency N   adaptive starting concurrency (default: auto-seed)\n"
               << "  -T, --threads N       fixed concurrency (disables auto-tuning)\n"
               << "  -r, --retries N       retry a host N times on transport error (default 0)\n"
+              << "      --cidr-dir DIR    classify each responder by CDN using CIDR lists in DIR;\n"
+              << "                        appends the host to <cdn-out-dir>/<provider>.txt\n"
+              << "      --cdn-out-dir DIR where to write the per-CDN files (default .)\n"
               << "  -f, --format FMT      output format: text | csv | json (default text)\n"
               << "      --resume          resume from <output>.cache, skipping checked hosts\n"
               << "      --no-resume       ignore any checkpoint and scan from the top\n"
@@ -59,6 +62,8 @@ bool parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "-c" || a == "--concurrency") cfg.concurrency = std::stoi(next("--concurrency"));
         else if (a == "-T" || a == "--threads") cfg.threads = std::stoi(next("--threads"));
         else if (a == "-r" || a == "--retries") cfg.retries = std::stoi(next("--retries"));
+        else if (a == "--cidr-dir") cfg.cidr_dir = next("--cidr-dir");
+        else if (a == "--cdn-out-dir") cfg.cdn_out_dir = next("--cdn-out-dir");
         else if (a == "--resume") cfg.resume = 1;
         else if (a == "--no-resume") cfg.resume = 2;
         else if (a == "--no-pause") cfg.no_pause = true;

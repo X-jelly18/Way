@@ -20,6 +20,7 @@ add_executable(server_scanner
   src/concurrency.cpp
   src/netprobe.cpp
   src/http.cpp
+  src/cidr.cpp
   src/scan.cpp
 )
 target_include_directories(server_scanner PRIVATE include)

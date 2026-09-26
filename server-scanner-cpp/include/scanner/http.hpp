@@ -13,6 +13,7 @@ namespace scanner {
 struct HostJob {
     std::string url;
     std::string headers;
+    std::string ip;        // remote IP actually connected to (for CDN lookup)
     std::chrono::steady_clock::time_point start;
     long status = 0;
     long port = 0;         // port actually connected to

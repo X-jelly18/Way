@@ -17,6 +17,13 @@ struct Config {
     Format format = Format::Text;
     bool no_pause = false;  // disable mid-scan pause on network loss
     int resume = 0;         // 0 = auto/ask, 1 = force resume, 2 = force fresh
+
+    // Optional CDN classification. When cidr_dir is set, each responding host is
+    // matched against the provider IP ranges loaded from it and appended to
+    // <cdn_out_dir>/<provider>.txt. This is separate from `output` and never
+    // touches the user's own results file.
+    std::string cidr_dir;
+    std::string cdn_out_dir = ".";
 };
 
 // Parse a --format value (text|csv|json); exits(2) on an invalid value.

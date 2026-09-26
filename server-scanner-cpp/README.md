@@ -33,6 +33,36 @@ their implementations under `src/`:
 | scan | `scan.hpp` | the multi-handle scan loop + stats |
 | entrypoint | `src/main.cpp` | thin orchestrator wiring the modules together |
 
+## CDN classification (optional)
+
+Point `--cidr-dir DIR` at a folder of CIDR lists and each **responding** host is
+matched against those provider ranges by the IP curl actually connected to. When
+a host's IP falls inside a provider's range, the host is appended to
+`<cdn-out-dir>/<provider>.txt` (e.g. `cloudflare.txt`).
+
+```sh
+server_scanner -i hosts.txt -o servers.txt --cidr-dir ./cdn-ip-ranges --cdn-out-dir ./by-cdn
+```
+
+- **Your own results are never touched.** The per-CDN files are entirely
+  separate from `--output`; that file is written exactly as it would be without
+  this flag.
+- **Provider name = filename.** Each `*.txt` under `DIR` (one level of
+  subdirectories is scanned too, so the upstream per-provider layout works) is
+  one provider; the name is the basename with a trailing `_plain`, `_ipv4`,
+  `_ipv6`, and `.txt` stripped — `cloudflare_plain.txt` → `cloudflare`.
+- **IPv4 and IPv6** ranges are both supported. A bare IP with no `/prefix` is
+  treated as a host route (`/32` or `/128`). Blank lines and `#` comments are
+  ignored.
+- **Overlaps** resolve to the alphabetically-first provider (deterministic).
+- **Fresh vs. resume.** Like the text output, each `<provider>.txt` is truncated
+  on the first hit of a fresh run and appended to on a resumed run.
+- A one-line summary at the end reports how many hosts landed in each provider.
+
+> Requires the real remote IP (`CURLINFO_PRIMARY_IP`), which is available in a
+> normal environment. Behind an HTTP(S) proxy that tunnels the connection, the
+> remote IP may be hidden and classification will find no matches.
+
 ## Resume & caching
 
 While a scan runs it writes a checkpoint next to the output file
@@ -110,6 +140,8 @@ Non-interactive:
 | `-c, --concurrency N` | adaptive starting concurrency (default: auto-seed) |
 | `-T, --threads N` | fixed concurrency — pins N in-flight requests, disables auto-tuning |
 | `-r, --retries N` | retry a host N times on transport error (default 0) |
+| `--cidr-dir DIR` | classify each responder by CDN using the CIDR lists in `DIR` |
+| `--cdn-out-dir DIR` | where to write the per-CDN `<provider>.txt` files (default `.`) |
 | `-f, --format FMT` | output format: `text` \| `csv` \| `json` (default `text`) |
 | `-v, --verbose` | print status for every host, not just responders |
 | `-h, --help` | show help |
