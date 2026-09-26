@@ -124,7 +124,7 @@ fn num<T: std::str::FromStr>(v: &str, name: &str) -> T {
 pub fn parse_args(args: &[String]) -> Option<Config> {
     let mut cfg = Config::default();
     let mut i = 1;
-    let prog = args.get(0).map(|s| s.as_str()).unwrap_or("njz");
+    let prog = args.get(0).map(|s| s.as_str()).unwrap_or("jz");
     let next = |i: &mut usize, name: &str| -> String {
         *i += 1;
         match args.get(*i) {

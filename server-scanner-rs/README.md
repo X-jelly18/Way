@@ -27,13 +27,13 @@ cd server-scanner-rs
 cargo build --release
 ```
 
-The binary is `target/release/njz`. Install it so `njz` works anywhere:
+The binary is `target/release/jz`. Install it so `jz` works anywhere:
 
 ```sh
 # Termux:
-cp target/release/njz $PREFIX/bin/njz
+cp target/release/jz $PREFIX/bin/jz
 # Linux:
-install -m755 target/release/njz ~/.local/bin/njz   # or /usr/local/bin with sudo
+install -m755 target/release/jz ~/.local/bin/jz   # or /usr/local/bin with sudo
 ```
 
 ## Usage
@@ -42,15 +42,15 @@ install -m755 target/release/njz ~/.local/bin/njz   # or /usr/local/bin with sud
 hosts file, output, threads, per-CDN dir); press Enter to accept each default:
 
 ```sh
-njz
+jz
 ```
 
 **Scripted (flags).** Passing `-i` skips every prompt:
 
 ```sh
-njz -i hosts.txt -o servers.txt            # server scan
-njz -i hosts.txt --resolve-only -f ndjson  # DNS-only, ndjson output
-cat hosts.txt | njz -i -                    # read hosts from stdin
+jz -i hosts.txt -o servers.txt            # server scan
+jz -i hosts.txt --resolve-only -f ndjson  # DNS-only, ndjson output
+cat hosts.txt | jz -i -                    # read hosts from stdin
 ```
 
 | Flag | Meaning |

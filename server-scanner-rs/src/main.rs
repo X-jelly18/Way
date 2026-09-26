@@ -1,4 +1,4 @@
-//! njz — fast HTTP(S) port/server scanner with built-in CDN classification.
+//! jz — fast HTTP(S) port/server scanner with built-in CDN classification.
 //!
 //! Prompt-based by default: run it with no -i and it walks you through the
 //! essentials; any flag skips its prompt so it also scripts cleanly. CDN ranges

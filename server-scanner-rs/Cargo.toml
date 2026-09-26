@@ -6,7 +6,7 @@ description = "Fast HTTP(S) port/server scanner with built-in CDN classification
 license = "MIT"
 
 [[bin]]
-name = "njz"
+name = "jz"
 path = "src/main.rs"
 
 [dependencies]
