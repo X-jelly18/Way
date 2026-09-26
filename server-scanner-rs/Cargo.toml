@@ -1,0 +1,21 @@
+[package]
+name = "server-scanner"
+version = "0.1.0"
+edition = "2021"
+description = "Fast HTTP(S) port/server scanner with built-in CDN classification"
+license = "MIT"
+
+[[bin]]
+name = "jz"
+path = "src/main.rs"
+
+[dependencies]
+# Blocking HTTP with a pure-Rust TLS stack (rustls) so it builds on Termux with
+# no system OpenSSL, and cert verification can be turned off for scanning.
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"

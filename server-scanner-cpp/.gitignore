@@ -1,0 +1,9 @@
+# build output
+build/
+*.o
+*.obj
+server_scanner
+
+# scan results
+servers.txt
+*.cache
