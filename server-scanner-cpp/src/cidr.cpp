@@ -66,6 +66,7 @@ void CidrDb::add_line(const std::string& raw, int provider) {
         }
         Entry6 e{bytes, prefix, provider};
         v6_[bytes[0]].push_back(e);
+        entries_++;
     } else {
         // IPv4
         struct in_addr a{};
@@ -76,6 +77,7 @@ void CidrDb::add_line(const std::string& raw, int provider) {
         uint32_t mask = prefix == 0 ? 0u : (0xFFFFFFFFu << (32 - prefix));
         Entry4 e{ip & mask, mask, provider};
         v4_[(e.network >> 24) & 0xFF].push_back(e);
+        entries_++;
     }
 }
 
@@ -138,7 +140,8 @@ bool CidrDb::load(const std::string& dir, int* providers_out,
     for (auto& b : v6_) std::stable_sort(b.begin(), b.end(), by_name6);
 
     if (providers_out) *providers_out = static_cast<int>(names_.size());
-    if (ranges_out) *ranges_out = total_lines;
+    if (ranges_out) *ranges_out = entries_;  // parsed ranges, not raw lines
+    (void)total_lines;
     return true;
 }
 

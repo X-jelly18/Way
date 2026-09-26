@@ -72,7 +72,8 @@ void OutputWriter::row(const std::string& text_line, const std::vector<std::stri
         }
         f << "}";
     }
-    f.flush();
+    // No per-row flush: the caller flushes periodically and at scan end so we
+    // don't pay a write syscall per row. (begin() and end() still flush.)
 }
 
 void OutputWriter::end() {

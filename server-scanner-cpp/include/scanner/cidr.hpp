@@ -27,7 +27,8 @@ public:
     bool load(const std::string& dir, int* providers_out = nullptr,
               long long* ranges_out = nullptr);
 
-    bool empty() const { return v4_.empty() && v6_.empty(); }
+    // v4_/v6_ are fixed 256-bucket arrays (never "empty"), so track real entries.
+    bool empty() const { return entries_ == 0; }
 
     // Provider name whose range contains `ip` (an IPv4 or IPv6 literal), or
     // nullopt when none match or `ip` doesn't parse.
@@ -46,6 +47,7 @@ private:
     };
 
     std::vector<std::string> names_;
+    long long entries_ = 0;  // total parsed ranges (v4 + v6)
     // Bucketed by first octet (0..255) so a lookup scans only its bucket.
     std::array<std::vector<Entry4>, 256> v4_;
     std::array<std::vector<Entry6>, 256> v6_;

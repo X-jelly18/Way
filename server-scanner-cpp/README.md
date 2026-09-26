@@ -49,12 +49,22 @@ server_scanner -i hosts.txt -o resolved.ndjson --resolve-only \
 ## Performance & memory
 
 - **Handle & object pooling** — libcurl easy handles and per-request job objects
-  are recycled (`curl_easy_reset`) instead of `init`/`cleanup` per host, so a
-  long scan doesn't churn the allocator.
+  are recycled (`curl_easy_reset`, retained string capacity) instead of
+  `init`/`cleanup` + `new`/`delete` per host, so a long scan doesn't churn the
+  allocator.
+- **Incremental Server capture** — only the `Server` header is kept (last hop
+  wins); response headers are never buffered whole, so a hostile target
+  streaming huge headers can't balloon memory.
 - **Connection cache** — the multi handle keeps a connection pool
   (`CURLMOPT_MAX_TOTAL_CONNECTIONS` / `MAXCONNECTS`) sized to the concurrency.
-- **Per-handle tuning** — HTTP/2 (falls back to 1.1), TCP keep-alive, a DNS
-  cache, and a small header-only buffer.
+- **Right-sized per-handle settings** — pinned HTTP/1.1 (each host is a distinct
+  origin probed once, so h2 negotiation and keep-alive don't pay off), a DNS
+  cache, a small 4 KB buffer, and a separate `--connect-timeout` so dead hosts
+  free their slot fast.
+- **Batched I/O** — output, checkpoint, and per-CDN writes flush on a ~1 s timer
+  and at exit instead of once per host (bounded resume loss).
+- **Reap-before-poll** loop ordering so freed slots refill without waiting on the
+  poll timeout; **fast membership** (`unordered_set`) for resume/dedup.
 - **Streaming** — the input is read line-by-line; the whole file is never loaded.
 
 > Memory note: `--dedup` and `--resume` keep an in-memory set of hosts (dedup
@@ -173,7 +183,8 @@ Non-interactive:
 | `--no-pause` | don't pause mid-scan when the network drops |
 | `-i, --input FILE` | hosts list (prompted if omitted) |
 | `-o, --output FILE` | results output file (default `servers.txt`) |
-| `-t, --timeout SECS` | per-request timeout (default 8) |
+| `-t, --timeout SECS` | overall per-request timeout (default 8) |
+| `--connect-timeout S` | connect-phase timeout (default: same as `--timeout`) |
 | `-c, --concurrency N` | adaptive starting concurrency (default: auto-seed) |
 | `-T, --threads N` | fixed concurrency — pins N in-flight requests, disables auto-tuning |
 | `-r, --retries N` | retry a host N times on transport error (default 0) |
@@ -186,6 +197,7 @@ Non-interactive:
 | `-H, --header 'K: V'` | add a request header (repeatable) |
 | `-x, --proxy URL` | route all requests through a proxy |
 | `-4` / `-6` | resolve/connect over IPv4 / IPv6 only |
+| `--verify-tls` | verify TLS certificates (off by default) |
 | `--no-follow` | don't follow HTTP redirects (report the listed host) |
 | `--probe-host HOST` | connectivity/seed probe target (default `m.google.com`) |
 | `--no-probe` | skip the startup connectivity probe and latency seed |
@@ -254,7 +266,9 @@ https://another.example.org
 
 ## Notes
 
-- TLS certificate verification is disabled, so hosts with self-signed or
-  mismatched certificates are still probed. Do not reuse this client for
-  anything that requires authenticated TLS.
+- TLS certificate verification is **off by default** (so hosts with self-signed
+  or mismatched certificates are still probed); pass `--verify-tls` to turn it
+  on. Don't rely on the default for anything that requires authenticated TLS.
+- Requests and redirects are restricted to `http`/`https`, so a stray
+  `file://`/`gopher://` line in the input can't be fetched.
 - Only scan hosts you are authorized to test.

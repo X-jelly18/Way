@@ -38,6 +38,7 @@ using namespace scanner;
 
 int main(int argc, char** argv) {
     std::signal(SIGINT, on_sigint);
+    std::signal(SIGPIPE, SIG_IGN);  // survive `… | head` closing the pipe
 
     Config cfg;
     if (!parse_args(argc, argv, cfg)) return 0;

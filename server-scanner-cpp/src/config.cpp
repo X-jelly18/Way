@@ -9,6 +9,32 @@
 
 namespace scanner {
 
+// Parse a numeric flag value, exiting cleanly (like parse_ports/parse_format)
+// instead of letting std::sto* throw and abort the process.
+static long long parse_num(const std::string& s, const char* name) {
+    try {
+        size_t pos = 0;
+        long long v = std::stoll(s, &pos);
+        if (pos != s.size()) throw std::invalid_argument("trailing");
+        return v;
+    } catch (...) {
+        std::cerr << "Invalid number for " << name << ": " << s << "\n";
+        std::exit(2);
+    }
+}
+
+static double parse_dbl(const std::string& s, const char* name) {
+    try {
+        size_t pos = 0;
+        double v = std::stod(s, &pos);
+        if (pos != s.size()) throw std::invalid_argument("trailing");
+        return v;
+    } catch (...) {
+        std::cerr << "Invalid number for " << name << ": " << s << "\n";
+        std::exit(2);
+    }
+}
+
 // Parse a comma-separated port list ("80,443,8443") into cfg.ports.
 static void parse_ports(const std::string& s, Config& cfg) {
     std::stringstream ss(s);
@@ -40,7 +66,8 @@ void usage(const char* prog) {
               << "  Port / server scanner: probe port 443 and report the Server header.\n"
               << "  -i, --input FILE      hosts list (prompted if omitted)\n"
               << "  -o, --output FILE     results output file (default servers.txt)\n"
-              << "  -t, --timeout SECS    per-request timeout (default 8)\n"
+              << "  -t, --timeout SECS    overall per-request timeout (default 8)\n"
+              << "      --connect-timeout S  connect-phase timeout (default: same as --timeout)\n"
               << "  -c, --concurrency N   adaptive starting concurrency (default: auto-seed)\n"
               << "  -T, --threads N       fixed concurrency (disables auto-tuning)\n"
               << "  -r, --retries N       retry a host N times on transport error (default 0)\n"
@@ -59,6 +86,7 @@ void usage(const char* prog) {
               << "      --cdn-out-dir DIR where to write the per-CDN files (default .)\n"
               << "      --cdn-only        only record responders that matched a CDN\n"
               << "  -f, --format FMT      output format: text | csv | json | ndjson (default text)\n"
+              << "      --verify-tls      verify TLS certs (off by default, like the scanner has been)\n"
               << "      --no-follow       don't follow HTTP redirects (report the listed host)\n"
               << "      --probe-host HOST connectivity/seed probe target (default m.google.com)\n"
               << "      --no-probe        skip the startup connectivity probe and latency seed\n"
@@ -92,14 +120,15 @@ bool parse_args(int argc, char** argv, Config& cfg) {
         };
         if (a == "-i" || a == "--input") cfg.input = next("--input");
         else if (a == "-o" || a == "--output") cfg.output = next("--output");
-        else if (a == "-t" || a == "--timeout") cfg.timeout = std::stoi(next("--timeout"));
-        else if (a == "-c" || a == "--concurrency") cfg.concurrency = std::stoi(next("--concurrency"));
-        else if (a == "-T" || a == "--threads") cfg.threads = std::stoi(next("--threads"));
-        else if (a == "-r" || a == "--retries") cfg.retries = std::stoi(next("--retries"));
+        else if (a == "-t" || a == "--timeout") cfg.timeout = (int)parse_num(next("--timeout"), "--timeout");
+        else if (a == "--connect-timeout") cfg.connect_timeout = (int)parse_num(next("--connect-timeout"), "--connect-timeout");
+        else if (a == "-c" || a == "--concurrency") cfg.concurrency = (int)parse_num(next("--concurrency"), "--concurrency");
+        else if (a == "-T" || a == "--threads") cfg.threads = (int)parse_num(next("--threads"), "--threads");
+        else if (a == "-r" || a == "--retries") cfg.retries = (int)parse_num(next("--retries"), "--retries");
         else if (a == "--ports") parse_ports(next("--ports"), cfg);
         else if (a == "--resolve-only" || a == "--dns") cfg.resolve_only = true;
-        else if (a == "--rate") cfg.rate = std::stod(next("--rate"));
-        else if (a == "--limit") cfg.limit = std::stoll(next("--limit"));
+        else if (a == "--rate") cfg.rate = parse_dbl(next("--rate"), "--rate");
+        else if (a == "--limit") cfg.limit = parse_num(next("--limit"), "--limit");
         else if (a == "--dedup") cfg.dedup = true;
         else if (a == "-A" || a == "--user-agent") cfg.user_agent = next("--user-agent");
         else if (a == "-H" || a == "--header") cfg.headers.push_back(next("--header"));
@@ -109,6 +138,7 @@ bool parse_args(int argc, char** argv, Config& cfg) {
         else if (a == "--cidr-dir") cfg.cidr_dir = next("--cidr-dir");
         else if (a == "--cdn-out-dir") cfg.cdn_out_dir = next("--cdn-out-dir");
         else if (a == "--cdn-only") cfg.cdn_only = true;
+        else if (a == "--verify-tls") cfg.verify_tls = true;
         else if (a == "--no-follow") cfg.no_follow = true;
         else if (a == "--probe-host") cfg.probe_host = next("--probe-host");
         else if (a == "--no-probe") cfg.no_probe = true;
@@ -125,6 +155,8 @@ bool parse_args(int argc, char** argv, Config& cfg) {
     if (cfg.threads < 0) cfg.threads = 0;
     if (cfg.rate < 0) cfg.rate = 0;
     if (cfg.limit < 0) cfg.limit = 0;
+    if (cfg.timeout < 1) cfg.timeout = 1;          // 0 => libcurl "no timeout"
+    if (cfg.connect_timeout < 0) cfg.connect_timeout = 0;  // 0 => use --timeout
     return true;
 }
 

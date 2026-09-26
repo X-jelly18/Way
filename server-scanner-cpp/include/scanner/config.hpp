@@ -13,6 +13,7 @@ struct Config {
     std::string input;
     std::string output = "servers.txt";
     int timeout = 8;
+    int connect_timeout = 0;  // connect-phase timeout secs; 0 => use `timeout`
     bool verbose = false;
     int concurrency = 0;  // adaptive seed; 0 => auto-seed from latency probe
     int threads = 0;      // fixed concurrency (adaptive off); 0 => adaptive
@@ -42,6 +43,7 @@ struct Config {
     bool cdn_only = false;          // only write responders that matched a CDN
     bool no_color = false;          // force-disable ANSI color
     bool no_follow = false;         // don't follow HTTP redirects
+    bool verify_tls = false;        // verify TLS certs (off by default)
     bool no_probe = false;          // skip the startup connectivity probe/seed
     std::string probe_host = "m.google.com";  // host for the connectivity probe
 };

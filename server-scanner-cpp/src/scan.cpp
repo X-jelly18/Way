@@ -1,17 +1,16 @@
 #include "scanner/scan.hpp"
 
-#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <deque>
 #include <fstream>
 #include <iostream>
-#include <map>
 #include <mutex>
 #include <optional>
-#include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <curl/curl.h>
@@ -37,21 +36,21 @@ void on_sigint(int) { g_stop = 1; }
 struct CdnWriter {
     std::string dir;
     bool resuming = false;
-    std::map<std::string, std::ofstream> streams;
+    std::unordered_map<std::string, std::ofstream> streams;
 
     void write(const std::string& provider, const std::string& host) {
         auto it = streams.find(provider);
         if (it == streams.end()) {
-            std::ofstream& f = streams[provider];
             std::string path = dir.empty() ? provider + ".txt"
                                            : dir + "/" + provider + ".txt";
-            f.open(path, resuming ? (std::ios::out | std::ios::app)
-                                  : (std::ios::out | std::ios::trunc));
-            it = streams.find(provider);
+            std::ofstream f(path, resuming ? (std::ios::out | std::ios::app)
+                                           : (std::ios::out | std::ios::trunc));
+            it = streams.emplace(provider, std::move(f)).first;
         }
-        it->second << host << "\n";
-        it->second.flush();
+        it->second << host << "\n";  // flushed in batches, not per hit
     }
+
+    void flush_all() { for (auto& kv : streams) kv.second.flush(); }
 };
 
 // ---------- rate limiter ----------
@@ -81,6 +80,13 @@ struct RateLimiter {
 
 // ---------- shared helpers ----------
 
+using HostSet = std::unordered_set<std::string>;
+
+// Default port for a URL's scheme (http => 80, otherwise https => 443).
+static long default_port(const std::string& url) {
+    return url.compare(0, 7, "http://") == 0 ? 80 : 443;
+}
+
 // Count non-blank, non-comment lines so progress can show a total + ETA. Returns
 // -1 for stdin (unknown total).
 static long long count_hosts(const std::string& path) {
@@ -97,25 +103,31 @@ static long long count_hosts(const std::string& path) {
 }
 
 // Open the results writer with the correct append/overwrite + header behavior.
-static void open_output(const Config& cfg, bool resuming, OutputWriter& out,
+// Returns false if the output file could not be opened.
+static bool open_output(const Config& cfg, bool resuming, OutputWriter& out,
                         const std::vector<std::string>& cols) {
     out.fmt = cfg.format;
     out.cols = cols;
-    // Text and ndjson stream and accumulate; csv/json are single documents that
-    // overwrite — unless resuming, when we append so prior rows survive.
-    bool append_out = (cfg.format == Format::Text) ||
-                      (cfg.format == Format::Ndjson) || resuming;
+    // Text accumulates across runs (appends). csv/json/ndjson are per-run
+    // documents that overwrite on a fresh run; on resume they append so prior
+    // rows survive.
+    bool append_out = (cfg.format == Format::Text) || resuming;
     if (resuming && cfg.format == Format::Csv) {
         std::ifstream probe(cfg.output);
         if (probe.peek() != std::ifstream::traits_type::eof()) out.suppress_header = true;
     }
     out.f.open(cfg.output, append_out ? (std::ios::out | std::ios::app) : std::ios::out);
+    if (!out.f) {
+        std::cerr << RED << "Can't open output file " << cfg.output << RESET << "\n";
+        return false;
+    }
     out.begin();
+    return true;
 }
 
 // Load the resume checkpoint (set of completed keys).
-static std::set<std::string> load_done(const std::string& cache_path, bool& resuming) {
-    std::set<std::string> done;
+static HostSet load_done(const std::string& cache_path, bool& resuming) {
+    HostSet done;
     if (resuming) {
         std::ifstream cf(cache_path);
         std::string h;
@@ -137,6 +149,12 @@ static std::optional<std::string> classify_hit(const CidrDb& cdn, CdnWriter& cdn
         st.cdn_counts[*prov]++;
     }
     return prov;
+}
+
+static long long cdn_total(const Stats& st) {
+    long long n = 0;
+    for (auto& kv : st.cdn_counts) n += kv.second;
+    return n;
 }
 
 static void print_progress(const char* verb, long long done, long long total,
@@ -171,12 +189,14 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
 
     std::string cache_path = cfg.output + ".cache";
     bool resuming = (cfg.resume == 1);
-    std::set<std::string> done = load_done(cache_path, resuming);
+    HostSet done = load_done(cache_path, resuming);
 
     OutputWriter out;
-    open_output(cfg, resuming, out, {"host", "port", "status", "server"});
+    if (!open_output(cfg, resuming, out, {"host", "port", "status", "server"}))
+        return st;
     std::ofstream cache(cache_path, resuming ? (std::ios::out | std::ios::app)
                                              : std::ios::out);
+    if (!cache) { std::cerr << RED << "Can't open checkpoint " << cache_path << RESET << "\n"; return st; }
     CdnWriter cdnw;
     cdnw.dir = cfg.cdn_out_dir;
     cdnw.resuming = resuming;
@@ -194,7 +214,9 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
         if (!job_pool.empty()) job_pool.pop_back();
         CURL* reuse = nullptr;
         if (!easy_pool.empty()) { reuse = easy_pool.back(); easy_pool.pop_back(); }
-        *j = HostJob{};
+        // Reset only the fields; retain string capacity by clearing, not moving.
+        j->url.clear(); j->server.clear(); j->ip.clear(); j->key.clear();
+        j->port_req = 0; j->status = 0; j->port = 0; j->attempts = 0;
         j->easy = reuse;  // setup_easy resets it; nullptr => it inits a new one
         return j;
     };
@@ -208,31 +230,37 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
         else delete j;
     };
 
-    // Host -> per-port job expansion, honoring dedup / resume-skip / limit.
     const std::vector<int> ports = cfg.ports.empty() ? std::vector<int>{0} : cfg.ports;
-    const bool single_default = (ports.size() == 1 && ports[0] == 0);
-    std::set<std::string> seen;
+    HostSet seen;
     long long dispatched_hosts = 0, skipped = 0;
     std::deque<HostJob*> pending;
+    std::unordered_set<HostJob*> inflight;  // jobs currently added to the multi
 
     auto next_job = [&]() -> HostJob* {
         while (pending.empty()) {
+            if (cfg.limit && dispatched_hosts >= cfg.limit) return nullptr;
             std::string raw;
             if (!std::getline(in, raw)) return nullptr;
             std::string h = normalize_host(raw);
             if (h.empty()) continue;
             if (cfg.dedup && !seen.insert(h).second) continue;
-            if (cfg.limit && dispatched_hosts >= cfg.limit) return nullptr;
-            dispatched_hosts++;
+            bool queued = false;
+            long dflt = default_port(h);
             for (int p : ports) {
-                std::string key = single_default ? h : h + "|" + std::to_string(p);
+                long eff = p > 0 ? p : dflt;
+                // Canonical key: a default-port job keys on the bare URL (so an
+                // implicit run and an explicit --ports 443 resume-match); other
+                // ports append "|port".
+                std::string key = (eff == dflt) ? h : h + "|" + std::to_string(eff);
                 if (!done.empty() && done.count(key)) { skipped++; continue; }
                 HostJob* job = acquire_job();
                 job->url = h;
                 job->port_req = p;
                 job->key = key;
                 pending.push_back(job);
+                queued = true;
             }
+            if (queued) dispatched_hosts++;  // count only hosts that produced a job
         }
         HostJob* job = pending.front();
         pending.pop_front();
@@ -246,8 +274,7 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
         win.push(ok, latency);
         st.checked++;
         if (ok) {
-            std::string server = find_header(job->headers, "server");
-            if (server.empty()) server = "(unknown)";
+            std::string server = job->server.empty() ? "(unknown)" : job->server;
             std::string pstr = std::to_string(job->port);
             std::string sstr = std::to_string(job->status);
             auto prov = classify_hit(cdn, cdnw, st, job->ip, job->url);
@@ -271,18 +298,24 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
     curl_multi_setopt(multi, CURLMOPT_MAX_TOTAL_CONNECTIONS, maxconn);
     curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, maxconn);
 
+    // ETA is only meaningful when checked count maps 1:1 to input lines.
+    long long eta_total = (ports.size() > 1 || cfg.dedup || cfg.limit) ? -1 : total;
+
     int active = 0;
     bool eof = false;
     auto scan_start = std::chrono::steady_clock::now();
     auto last_adjust = scan_start;
+    auto last_flush = scan_start;
+    auto flush_all = [&]() { out.flush(); cache.flush(); cdnw.flush_all(); };
 
     while (!g_stop) {
         int budget = limiter.take(lim.limit - active);
         while (!eof && active < lim.limit && budget > 0) {
             HostJob* job = next_job();
             if (!job) { eof = true; break; }
-            setup_easy(job, cfg, extra_headers);
-            curl_multi_add_handle(multi, job->easy);
+            if (!setup_easy(job, cfg, extra_headers)) { release_job(job); continue; }
+            if (curl_multi_add_handle(multi, job->easy) != CURLM_OK) { release_job(job); continue; }
+            inflight.insert(job);
             active++;
             budget--;
         }
@@ -291,8 +324,8 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
 
         int still_running = 0;
         curl_multi_perform(multi, &still_running);
-        curl_multi_poll(multi, nullptr, 0, 100, nullptr);
 
+        // Reap completed transfers BEFORE polling so freed slots refill promptly.
         CURLMsg* msg;
         int msgs_left = 0;
         while ((msg = curl_multi_info_read(multi, &msgs_left))) {
@@ -307,28 +340,38 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
             if (curl_easy_getinfo(e, CURLINFO_PRIMARY_IP, &ipbuf) == CURLE_OK && ipbuf)
                 job->ip = ipbuf;
             curl_multi_remove_handle(multi, e);  // keep the handle for reuse
+            inflight.erase(job);
 
             if (res != CURLE_OK && job->attempts < cfg.retries) {
                 job->attempts++;
-                job->headers.clear();
+                job->server.clear();
                 job->ip.clear();
-                setup_easy(job, cfg, extra_headers);  // resets the same handle
-                curl_multi_add_handle(multi, job->easy);
-                continue;
+                if (setup_easy(job, cfg, extra_headers) &&
+                    curl_multi_add_handle(multi, job->easy) == CURLM_OK) {
+                    inflight.insert(job);
+                    continue;  // retry in flight; slot stays occupied
+                }
+                // Couldn't re-arm the retry: fall through and finalize as failed.
             }
 
             finalize(job, res);
             cache << job->key << "\n";
-            cache.flush();
             release_job(job);
             active--;
         }
 
+        // Periodic flush (out first, then checkpoint, so the checkpoint never
+        // claims a host whose output row isn't persisted yet).
+        auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration<double>(now - last_flush).count() >= 1.0) {
+            flush_all();
+            last_flush = now;
+        }
+
         if (!cfg.verbose) {
-            double el = std::chrono::duration<double>(
-                            std::chrono::steady_clock::now() - scan_start).count();
-            print_progress("checked", st.checked, total, st.matches, "responded",
-                           0, el > 0 ? st.checked / el : 0,
+            double el = std::chrono::duration<double>(now - scan_start).count();
+            print_progress("checked", st.checked, eta_total, st.matches, "responded",
+                           cdn_total(st), el > 0 ? st.checked / el : 0,
                            ("concurrency=" + std::to_string(lim.limit)).c_str());
         }
 
@@ -347,17 +390,27 @@ static Stats run_http(const Config& cfg, int initial_concurrency, bool adaptive,
         }
 
         if (adaptive) {
-            auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration<double>(now - last_adjust).count() >= 2.5) {
                 maybe_adjust(lim, win);
                 last_adjust = now;
             }
         }
+
+        curl_multi_poll(multi, nullptr, 0, 100, nullptr);
     }
 
+    // On Ctrl+C, jobs may still be queued or in flight. curl_multi_cleanup does
+    // not free easy handles that are still added, so remove+recycle everything.
+    for (HostJob* j : pending) release_job(j);       // queued, never started
+    pending.clear();
+    for (HostJob* j : inflight) {                    // added to the multi
+        if (j->easy) curl_multi_remove_handle(multi, j->easy);
+        release_job(j);
+    }
+    inflight.clear();
+
+    flush_all();
     out.end();
-    // Any jobs still queued (limit/g_stop) never ran: recycle them.
-    for (HostJob* j : pending) release_job(j);
     curl_multi_cleanup(multi);
     for (CURL* e : easy_pool) curl_easy_cleanup(e);
     for (HostJob* j : job_pool) delete j;
@@ -380,12 +433,14 @@ static Stats run_resolve(const Config& cfg, const CidrDb& cdn, long long total) 
 
     std::string cache_path = cfg.output + ".cache";
     bool resuming = (cfg.resume == 1);
-    std::set<std::string> done = load_done(cache_path, resuming);
+    HostSet done = load_done(cache_path, resuming);
 
     OutputWriter out;
-    open_output(cfg, resuming, out, {"host", "ip", "cdn"});
+    if (!open_output(cfg, resuming, out, {"host", "ip", "cdn"}))
+        return st;
     std::ofstream cache(cache_path, resuming ? (std::ios::out | std::ios::app)
                                              : std::ios::out);
+    if (!cache) { std::cerr << RED << "Can't open checkpoint " << cache_path << RESET << "\n"; return st; }
     CdnWriter cdnw;
     cdnw.dir = cfg.cdn_out_dir;
     cdnw.resuming = resuming;
@@ -394,15 +449,19 @@ static Stats run_resolve(const Config& cfg, const CidrDb& cdn, long long total) 
     limiter.rate = cfg.rate;
 
     std::mutex mtx;
-    std::set<std::string> seen;
+    HostSet seen;
     long long dispatched = 0, skipped = 0;
     auto scan_start = std::chrono::steady_clock::now();
+    auto last_flush = scan_start;
+    auto flush_all = [&]() { out.flush(); cache.flush(); cdnw.flush_all(); };
 
     // Pull the next host to resolve under the lock (dedup/resume/limit/rate).
+    // Returns false only when truly finished; returns true with out_host empty
+    // when rate-limited this tick (caller backs off and retries).
     auto next_host = [&](std::string& out_host) -> bool {
         for (;;) {
             if (g_stop) return false;
-            if (cfg.rate > 0 && limiter.take(1) == 0) return true;  // caller retries after a nap
+            if (cfg.rate > 0 && limiter.take(1) == 0) { out_host.clear(); return true; }
             std::string raw;
             if (!std::getline(in, raw)) return false;
             std::string h = normalize_host(raw);
@@ -428,8 +487,8 @@ static Stats run_resolve(const Config& cfg, const CidrDb& cdn, long long total) 
                     std::lock_guard<std::mutex> lk(mtx);
                     got = next_host(host);
                 }
-                if (!got) return;   // truly finished: EOF, --limit reached, or stopped
-                if (host.empty()) {  // rate-limited this tick; back off and retry
+                if (!got) return;   // finished: EOF, --limit, or stopped
+                if (host.empty()) { // rate-limited this tick
                     std::this_thread::sleep_for(std::chrono::milliseconds(3));
                     continue;
                 }
@@ -454,20 +513,22 @@ static Stats run_resolve(const Config& cfg, const CidrDb& cdn, long long total) 
                     std::cout << "\r" << RED << "[--] " << host << " -> no DNS" << RESET << "\n";
                 }
                 cache << host << "\n";
-                cache.flush();
+                auto now = std::chrono::steady_clock::now();
+                if (std::chrono::duration<double>(now - last_flush).count() >= 1.0) {
+                    flush_all();
+                    last_flush = now;
+                }
                 if (!cfg.verbose) {
-                    double el = std::chrono::duration<double>(
-                                    std::chrono::steady_clock::now() - scan_start).count();
-                    long long cdnm = 0;
-                    for (auto& kv : st.cdn_counts) cdnm += kv.second;
+                    double el = std::chrono::duration<double>(now - scan_start).count();
                     print_progress("resolved", st.checked, total, st.matches, "with-ip",
-                                   cdnm, el > 0 ? st.checked / el : 0, nullptr);
+                                   cdn_total(st), el > 0 ? st.checked / el : 0, nullptr);
                 }
             }
         });
     }
     for (auto& w : workers) w.join();
 
+    flush_all();
     out.end();
     cache.close();
     st.skipped = skipped;

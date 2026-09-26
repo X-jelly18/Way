@@ -26,6 +26,7 @@ struct OutputWriter {
 
     void begin();
     void row(const std::string& text_line, const std::vector<std::string>& vals);
+    void flush() { f.flush(); }
     void end();
 };
 
